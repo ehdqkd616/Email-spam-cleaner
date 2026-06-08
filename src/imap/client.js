@@ -32,26 +32,49 @@ function groupByFolder(encodedIds) {
 
 class ImapClient {
   constructor({ user, password }, { host, port, folders = {} }) {
-    this._folders = { ...DEFAULT_FOLDERS, ...folders };
-    this._email   = user;
-    this.imap = new ImapFlow({
+    this._folders  = { ...DEFAULT_FOLDERS, ...folders };
+    this._email    = user;
+    this._imapOpts = {
       host, port, secure: true,
       auth: { user, pass: password },
       logger: false,
       tls: { rejectUnauthorized: false },
-      // 연결 유지를 위한 소켓 타임아웃 (ms)
       socketTimeout: 60000,
-    });
+    };
+    this._createImap();
+  }
+
+  _createImap() {
+    // IMAP_DEBUG=1 환경변수로 서버 응답 로깅 활성화 (비밀번호 포함 클라이언트 명령 제외)
+    const debugLogger = process.env.IMAP_DEBUG === '1' ? {
+      debug: ({ src, msg }) => {
+        if (src === 'c' && /^[A-Z\d]+ (LOGIN|AUTHENTICATE)/i.test(msg)) return;
+        process.stderr.write(`[IMAP-${src.toUpperCase()}] ${msg}\n`);
+      },
+      info:  ({ src, msg }) => process.stderr.write(`[IMAP-${src.toUpperCase()}] ${msg}\n`),
+      warn:  ({ src, msg }) => process.stderr.write(`[IMAP-WARN] ${msg}\n`),
+      error: ({ src, msg }) => process.stderr.write(`[IMAP-ERR] ${msg}\n`),
+    } : false;
+
+    this.imap = new ImapFlow({ ...this._imapOpts, logger: debugLogger });
     // 'error' 이벤트 미청취 시 Node 프로세스 전체 크래시 방지
-    // (ImapFlow가 연결 끊김 시 error 이벤트를 emit — 리스너 없으면 uncaughtException)
     this.imap.on('error', () => {});
   }
 
   get folders() { return this._folders; }
+  // ImapFlow 연결 사용 가능 여부 (Command failed 후 서버 BYE 감지에 사용)
+  get usable()  { return !!this.imap.usable; }
 
   async connect()    { await this.imap.connect(); }
   async disconnect() { try { await this.imap.logout(); } catch (_) {} }
   async getProfile() { return { emailAddress: this._email }; }
+
+  // 연결이 끊어진 경우 ImapFlow 인스턴스를 재생성하여 재연결
+  async reconnect() {
+    try { await this.imap.logout(); } catch (_) {}
+    this._createImap();
+    await this.imap.connect();
+  }
 
   async listFolders() {
     const list = await this.imap.list();
@@ -95,39 +118,39 @@ class ImapClient {
     return results;
   }
 
-  // SEARCH 없이 폴더 전체 메시지 메타데이터 조회 (서버 결과 수 제한 우회)
-  // 한 번에 최대 MAX_FETCH개씩 배치 처리 — 서버 타임아웃·메모리 과부하 방지
-  async fetchAllMetadata(folder) {
-    const MAX_FETCH = 2000; // 한 번에 가져올 최대 메시지 수
+  // 폴더 전체 메시지 메타데이터 조회
+  // mailbox.exists로 전체 수 파악 후 BATCH 단위 시퀀스 범위 fetch
+  // — Nate 등 서버별 FETCH 응답 수 제한(1000개 등) 우회
+  async fetchAllMetadata(folder, onProgress) {
+    const BATCH   = 500;
     const results = [];
 
-    // 먼저 폴더 내 전체 UID 목록 조회
+    // 폴더 선택 → 전체 메시지 수 확인 후 즉시 해제
     const lock0 = await this.imap.getMailboxLock(folder, { readOnly: true });
-    let allUids;
-    try {
-      allUids = await this.imap.search({ all: true }, { uid: true });
-    } finally { lock0.release(); }
+    const total  = this.imap.mailbox?.exists ?? 0;
+    lock0.release();
 
-    if (!allUids || !allUids.length) return results;
+    if (total === 0) return results;
 
-    // UID를 MAX_FETCH 단위로 청크 분할하여 순차 fetch
-    for (let i = 0; i < allUids.length; i += MAX_FETCH) {
-      const chunk = allUids.slice(i, i + MAX_FETCH);
-      const lock  = await this.imap.getMailboxLock(folder, { readOnly: true });
+    for (let start = 1; start <= total; start += BATCH) {
+      const end  = Math.min(start + BATCH - 1, total);
+      const lock = await this.imap.getMailboxLock(folder, { readOnly: true });
       try {
-        for await (const msg of this.imap.fetch(chunk, { envelope: true, uid: true }, { uid: true })) {
-          const f = msg.envelope?.from?.[0];
+        for await (const msg of this.imap.fetch(`${start}:${end}`, { envelope: true, uid: true })) {
+          if (!msg.envelope || !msg.uid) continue; // UID 미반환 → NaN 인코딩 방지
+          const f = msg.envelope.from?.[0];
           const fromStr = f ? (f.name ? `${f.name} <${f.address}>` : f.address) : '';
           results.push({
             id: encodeId(folder, msg.uid), uid: msg.uid, folder,
             payload: { headers: [
-              { name: 'Subject', value: msg.envelope?.subject || '' },
+              { name: 'Subject', value: msg.envelope.subject || '' },
               { name: 'From',    value: fromStr },
-              { name: 'Date',    value: safeIso(msg.envelope?.date) || '' },
+              { name: 'Date',    value: safeIso(msg.envelope.date) || '' },
             ]},
           });
         }
       } finally { lock.release(); }
+      if (onProgress) onProgress(end, total);
     }
 
     return results;
@@ -155,7 +178,12 @@ class ImapClient {
     try { await this.imap.mailboxCreate(name); }
     catch (err) {
       const msg = `${err.message || ''} ${err.responseText || ''}`.toLowerCase();
-      if (!msg.includes('already exists') && !msg.includes('alreadyexists')) throw err;
+      // 표준(RFC 5530) [ALREADYEXISTS] 및 서버별 변형 응답 처리
+      const isExisting =
+        msg.includes('already exist') || msg.includes('alreadyexist') ||
+        msg.includes('mailboxexist')  || msg.includes('duplicate')    ||
+        msg.includes('already created') || msg.includes('exists already');
+      if (!isExisting) throw err;
     }
   }
 
@@ -168,12 +196,16 @@ class ImapClient {
   }
 
   async _moveTo(encodedIds, targetFolder) {
+    const CHUNK = 50; // 구형 IMAP 서버의 명령줄 길이 제한 우회
     let count = 0;
     for (const [folder, uids] of Object.entries(groupByFolder(encodedIds))) {
       if (folder === targetFolder) { count += uids.length; continue; }
-      const lock = await this.imap.getMailboxLock(folder);
-      try { await this.imap.messageMove(uids, targetFolder, { uid: true }); count += uids.length; }
-      finally { lock.release(); }
+      for (let i = 0; i < uids.length; i += CHUNK) {
+        const chunk = uids.slice(i, i + CHUNK);
+        const lock  = await this.imap.getMailboxLock(folder);
+        try { await this.imap.messageMove(chunk, targetFolder, { uid: true }); count += chunk.length; }
+        finally { lock.release(); }
+      }
     }
     return count;
   }

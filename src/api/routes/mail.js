@@ -192,70 +192,108 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
       : require('../../categories');
 
     logger.info('CATEGORIZE', `[${provider}] 자동 분류 시작`);
-    log('info', '📂 받은편지함 전체 메시지 헤더 가져오는 중...');
-    let metadatas;
-    try {
-      metadatas = await client.fetchAllMetadata('INBOX');
-    } catch (err) {
-      logger.error('CATEGORIZE', `[${provider}] 헤더 조회 실패: ${err.message}`);
-      log('error', `❌ 헤더 조회 실패: ${err.message}`);
-      send('error', { message: `헤더 조회 실패: ${err.message}` });
-      return;
-    }
 
-    logger.info('CATEGORIZE', `[${provider}] 받은편지함 ${metadatas.length}개 메시지 분석`);
-    log('info', `받은편지함 ${metadatas.length}개 메시지 분석 완료`);
+    // Nate 등 IMAP 서버는 한 번 SELECT 시 최대 N개(보통 1000개)만 노출
+    // → 분류·이동 후 재조회하면 숨어있던 이전 메일이 새로 나타남
+    // → UID로 처리 여부를 추적하며 이동된 메일이 없어질 때까지 패스를 반복
+    const processedUids = new Set();
+    const catTotals     = {};          // cat.key → 누적 이동 수
+    let   totalMoved    = 0;
+    let   pass          = 0;
+    const MAX_PASSES    = 100;         // 안전 상한: 최대 100 × 1000 = 10만 건
 
-    if (!metadatas.length) {
-      log('info', '받은편지함에 메일이 없습니다.');
-      send('complete', { total: 0 });
-      return;
-    }
+    while (pass < MAX_PASSES) {
+      pass++;
 
-    // 2단계 분류: 광고 감지 → 카테고리 매칭 (matcher.js 사용)
-    const buckets = {};
-    let skippedAds = 0;
+      log('info', pass === 1
+        ? '📂 받은편지함 전체 메시지 헤더 가져오는 중...'
+        : `  ↳ 패스 ${pass}: 추가 메시지 확인 중...`);
 
-    for (const msg of metadatas) {
-      const subject = getHeader(msg, 'Subject');
-      const from    = getHeader(msg, 'From');
-      const cat     = matchCategory(subject, from, CATEGORIES);
-
-      if (!cat) { skippedAds++; continue; }
-      if (!buckets[cat.key]) buckets[cat.key] = { cat, msgs: [] };
-      buckets[cat.key].msgs.push(msg);
-    }
-
-    if (skippedAds > 0) log('info', `  광고/미분류 제외: ${skippedAds}개`);
-
-    let total = 0;
-    const historyResults = [];
-    for (const cat of CATEGORIES) {
-      const bucket = buckets[cat.key];
-      if (!bucket || !bucket.msgs.length) {
-        log('info', `  [${cat.name}] 해당 메일 없음`);
-        continue;
-      }
-      const { msgs } = bucket;
-      log('info', `  [${cat.name}] ${msgs.length}개 이동 중...`);
+      let metadatas;
       try {
-        await client.createFolder(cat.name);
-        await client.moveTo(msgs.map((m) => m.id), cat.name);
-        total += msgs.length;
-        historyResults.push({ key: cat.key, name: cat.name, count: msgs.length });
-        logger.success('CATEGORIZE', `[${provider}] [${cat.name}] ${msgs.length}개 이동 완료`);
-        log('success', `  ✓ [${cat.name}] ${msgs.length}개 이동 완료`);
+        metadatas = await client.fetchAllMetadata('INBOX');
       } catch (err) {
-        logger.error('CATEGORIZE', `[${provider}] [${cat.name}] 실패: ${err.message}`);
-        log('error', `  ✗ [${cat.name}] 실패: ${err.message}`);
+        logger.error('CATEGORIZE', `[${provider}] 헤더 조회 실패: ${err.message}`);
+        log('error', `❌ 헤더 조회 실패: ${err.message}`);
+        send('error', { message: `헤더 조회 실패: ${err.message}` });
+        return;
       }
+
+      if (!metadatas.length) break;
+
+      // 이미 처리한 UID 제외 — 이전 패스의 미분류 메일이 다시 보일 수 있음
+      const newMsgs = metadatas.filter(m => !processedUids.has(m.uid));
+      if (!newMsgs.length) break;
+      newMsgs.forEach(m => processedUids.add(m.uid));
+
+      logger.info('CATEGORIZE', `[${provider}] 받은편지함 ${metadatas.length}개 메시지 분석`);
+      log('info', pass === 1
+        ? `받은편지함 ${metadatas.length}개 메시지 분석 완료`
+        : `  신규 ${newMsgs.length}개 분석 (누적 ${processedUids.size}개)`);
+
+      // 광고 감지 → 카테고리 매칭
+      const buckets = {};
+      let skippedAds = 0;
+      for (const msg of newMsgs) {
+        const subject = getHeader(msg, 'Subject');
+        const from    = getHeader(msg, 'From');
+        const cat     = matchCategory(subject, from, CATEGORIES);
+        if (!cat) { skippedAds++; continue; }
+        if (!buckets[cat.key]) buckets[cat.key] = { cat, msgs: [] };
+        buckets[cat.key].msgs.push(msg);
+      }
+      if (skippedAds > 0) log('info', `  광고/미분류 제외: ${skippedAds}개`);
+
+      // 카테고리 이동
+      let movedInPass = 0;
+      let reconnectFailed = false;
+      for (const cat of CATEGORIES) {
+        const bucket = buckets[cat.key];
+        if (!bucket || !bucket.msgs.length) continue;
+
+        const folderPath = cat.key; // ASCII 키 사용 — 한국어 mUTF-7 인코딩 실패 방지
+        log('info', `  [${cat.name}] ${bucket.msgs.length}개 이동 중...`);
+        try {
+          await client.createFolder(folderPath);
+          await client.moveTo(bucket.msgs.map(m => m.id), folderPath);
+          movedInPass              += bucket.msgs.length;
+          totalMoved               += bucket.msgs.length;
+          catTotals[cat.key]        = (catTotals[cat.key] || 0) + bucket.msgs.length;
+          logger.success('CATEGORIZE', `[${provider}] [${cat.name}] ${bucket.msgs.length}개 이동 완료`);
+          log('success', `  ✓ [${cat.name}] ${bucket.msgs.length}개 이동 완료`);
+        } catch (err) {
+          const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
+          logger.error('CATEGORIZE', `[${provider}] [${cat.name}] 실패: ${err.message}${detail}`);
+          log('error', `  ✗ [${cat.name}] 실패: ${err.message}${detail}`);
+          try {
+            await client.reconnect();
+            logger.info('CATEGORIZE', `[${provider}] 재연결 성공`);
+          } catch (reconnErr) {
+            logger.error('CATEGORIZE', `[${provider}] 재연결 실패: ${reconnErr.message}`);
+            reconnectFailed = true;
+            break;
+          }
+        }
+      }
+
+      if (reconnectFailed) break;
+      // 이번 패스에서 이동한 것이 없으면 숨어있던 메일도 없음 → 완료
+      if (movedInPass === 0) break;
     }
 
+    // 카테고리별 최종 결과 표시
+    for (const cat of CATEGORIES) {
+      if (!catTotals[cat.key]) log('info', `  [${cat.name}] 해당 메일 없음`);
+    }
+
+    const historyResults = Object.entries(catTotals).map(([key, count]) => ({
+      key, count, name: CATEGORIES.find(c => c.key === key)?.name || key,
+    }));
     if (historyResults.length > 0) history.addRecord(provider, historyResults);
 
-    logger.success('CATEGORIZE', `[${provider}] 자동 분류 완료 — 총 ${total}개`);
-    log('success', `✅ 총 ${total}개 메일 분류 완료`);
-    send('complete', { total });
+    logger.success('CATEGORIZE', `[${provider}] 자동 분류 완료 — 총 ${totalMoved}개`);
+    log('success', `✅ 총 ${totalMoved}개 메일 분류 완료 (${pass}회 패스)`);
+    send('complete', { total: totalMoved });
   } catch (err) {
     logger.error('CATEGORIZE', `[${provider}] 분류 오류: ${err.message}`);
     send('error', { message: err.message });

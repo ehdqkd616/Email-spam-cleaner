@@ -22,7 +22,9 @@ async function categorize(client) {
   const fetchSpinner = ora('받은편지함 전체 메시지 헤더 가져오는 중...').start();
   let metadatas;
   try {
-    metadatas = await client.fetchAllMetadata('INBOX');
+    metadatas = await client.fetchAllMetadata('INBOX', (done, total) => {
+      fetchSpinner.text = `받은편지함 메시지 가져오는 중... (${done}/${total}개)`;
+    });
     fetchSpinner.succeed(`받은편지함 ${metadatas.length}개 메시지 분석 완료`);
     logger.info('CATEGORIZE', `IMAP 받은편지함 ${metadatas.length}개 메시지 로드`, true);
   } catch (err) {
@@ -69,8 +71,16 @@ async function categorize(client) {
       logger.success('CATEGORIZE', `[IMAP][${cat.name}] ${msgs.length}개 이동 완료`, true);
       total += msgs.length;
     } catch (err) {
-      spinner.fail(chalk.red(`[${cat.name}] 실패: ${err.message}`));
-      logger.error('CATEGORIZE', `[IMAP][${cat.name}] 실패: ${err.message}`, true);
+      const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
+      spinner.fail(chalk.red(`[${cat.name}] 실패: ${err.message}${detail}`));
+      logger.error('CATEGORIZE', `[IMAP][${cat.name}] 실패: ${err.message}${detail}`, true);
+      // Command failed 후 서버가 BYE를 비동기 전송 가능 → 즉시 재연결로 다음 카테고리 보호
+      try {
+        await client.reconnect();
+        logger.info('CATEGORIZE', '[IMAP] 재연결 성공', true);
+      } catch (reconnErr) {
+        logger.error('CATEGORIZE', `[IMAP] 재연결 실패: ${reconnErr.message}`, true);
+      }
     }
   }
 
