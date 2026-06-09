@@ -121,6 +121,36 @@ class GmailClient {
     }
   }
 
+  async getMessagesInLabel(labelId, limit = 10000) {
+    const ids = [];
+    let pageToken;
+    do {
+      const res = await this.api.users.messages.list({
+        userId: USER_ID,
+        labelIds: [labelId],
+        maxResults: Math.min(SEARCH_PAGE_SIZE, limit - ids.length),
+        pageToken,
+      });
+      ids.push(...(res.data.messages || []).map((m) => m.id));
+      pageToken = res.data.nextPageToken;
+    } while (pageToken && ids.length < limit);
+    return ids;
+  }
+
+  async removeLabelsFromMessages(ids, labelId) {
+    for (let i = 0; i < ids.length; i += BATCH_LIMIT) {
+      await this.api.users.messages.batchModify({
+        userId: USER_ID,
+        requestBody: { ids: ids.slice(i, i + BATCH_LIMIT), removeLabelIds: [labelId] },
+      });
+      if (i + BATCH_LIMIT < ids.length) await sleep(200);
+    }
+  }
+
+  async deleteLabel(labelId) {
+    await this.api.users.labels.delete({ userId: USER_ID, id: labelId });
+  }
+
   async getProfile() {
     const res = await this.api.users.getProfile({ userId: USER_ID });
     return res.data;

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { api, scanStream, categorizeStream } from '../lib/api';
+import { api, scanStream, categorizeStream, migrateFoldersStream } from '../lib/api';
 import { PROVIDERS, cn } from '../lib/utils';
 import Button from '../components/Button';
 import Toast from '../components/Toast';
@@ -53,6 +53,7 @@ export default function Dashboard() {
   const [loading, setLoading]     = useState('');
   const [progress, setProgress]   = useState([]);
   const [logs, setLogs]           = useState([]);
+  const [migrateLogs, setMigrateLogs] = useState([]);
   const [toast, setToast]         = useState(null);
   const [sidebarOpen, setSidebar] = useState(false);
   const [serverLogs, setServerLogs]     = useState([]);
@@ -134,6 +135,18 @@ export default function Dashboard() {
         if (ev === 'error')   { showToast(data.message, 'error'); setLoading(''); stop(); }
       },
       () => { showToast('분류 오류', 'error'); setLoading(''); }
+    );
+  }
+
+  function handleMigrateFolders() {
+    setLoading('migrate'); setMigrateLogs([]);
+    const stop = migrateFoldersStream(selected,
+      (ev, data) => {
+        if (ev === 'log')      setMigrateLogs((l) => [...l, data]);
+        if (ev === 'complete') { showToast(`폴더 이름 변경 완료! (${data.total}개 이동)`); setLoading(''); stop(); }
+        if (ev === 'error')    { showToast(data.message, 'error'); setLoading(''); stop(); }
+      },
+      () => { showToast('마이그레이션 오류', 'error'); setLoading(''); }
     );
   }
 
@@ -329,14 +342,27 @@ export default function Dashboard() {
                     </div>
                   </div>
                   <div style={S.cardBody}>
-                    <Button variant="primary" size="md" onClick={handleCategorize} loading={loading === 'categorize'} disabled={!!loading}>
-                      분류 실행
-                    </Button>
+                    <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                      <Button variant="primary" size="md" onClick={handleCategorize} loading={loading === 'categorize'} disabled={!!loading}>
+                        분류 실행
+                      </Button>
+                      <Button variant="outline" size="md" onClick={handleMigrateFolders} loading={loading === 'migrate'} disabled={!!loading}>
+                        폴더 이름 정리
+                      </Button>
+                    </div>
                     {logs.length > 0 && (
                       <div style={{ marginTop: 16, background: '#f8fafc', borderRadius: 12, padding: 16, maxHeight: 176, overflowY: 'auto', border: '1px solid #e2e8f0' }}>
                         {logs.map((l, i) => (
                           <p key={i} style={{ fontSize: 12, color: '#64748b', fontFamily: 'monospace', lineHeight: 1.6 }}>{l}</p>
                         ))}
+                      </div>
+                    )}
+                    {migrateLogs.length > 0 && (
+                      <div style={{ marginTop: 16, background: '#f8fafc', borderRadius: 12, padding: 16, maxHeight: 176, overflowY: 'auto', border: '1px solid #e2e8f0' }}>
+                        {migrateLogs.map((l, i) => {
+                          const color = l.level === 'error' ? '#dc2626' : l.level === 'success' ? '#16a34a' : '#64748b';
+                          return <p key={i} style={{ fontSize: 12, color, fontFamily: 'monospace', lineHeight: 1.6 }}>{l.message}</p>;
+                        })}
                       </div>
                     )}
                   </div>

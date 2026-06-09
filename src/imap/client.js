@@ -181,7 +181,8 @@ class ImapClient {
       // 표준(RFC 5530) [ALREADYEXISTS] 및 서버별 변형 응답 처리
       const isExisting =
         msg.includes('already exist') || msg.includes('alreadyexist') ||
-        msg.includes('mailboxexist')  || msg.includes('duplicate')    ||
+        msg.includes('mailboxexist')  || msg.includes('mailbox exists') ||
+        msg.includes('duplicate')     ||
         msg.includes('already created') || msg.includes('exists already');
       if (!isExisting) throw err;
     }

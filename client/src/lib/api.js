@@ -60,3 +60,12 @@ export function categorizeStream(provider, onEvent, onError) {
   es.onerror = (e) => { onError(e); es.close(); };
   return () => es.close();
 }
+
+export function migrateFoldersStream(provider, onEvent, onError) {
+  const es = new EventSource(`/api/mail/${provider}/migrate-folders`, { withCredentials: true });
+  ['log', 'complete', 'error'].forEach((ev) => {
+    es.addEventListener(ev, (e) => onEvent(ev, JSON.parse(e.data)));
+  });
+  es.onerror = (e) => { onError(e); es.close(); };
+  return () => es.close();
+}

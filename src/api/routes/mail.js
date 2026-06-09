@@ -251,7 +251,7 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
         const bucket = buckets[cat.key];
         if (!bucket || !bucket.msgs.length) continue;
 
-        const folderPath = cat.key; // ASCII 키 사용 — 한국어 mUTF-7 인코딩 실패 방지
+        const folderPath = cat.name;
         log('info', `  [${cat.name}] ${bucket.msgs.length}개 이동 중...`);
         try {
           await client.createFolder(folderPath);
@@ -296,6 +296,93 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
     send('complete', { total: totalMoved });
   } catch (err) {
     logger.error('CATEGORIZE', `[${provider}] 분류 오류: ${err.message}`);
+    send('error', { message: err.message });
+  } finally {
+    if (client?.disconnect) await client.disconnect().catch(() => {});
+    res.end();
+  }
+});
+
+// ── GET /api/mail/:provider/migrate-folders  (SSE) ───────────────
+router.get('/:provider/migrate-folders', requireAuth, async (req, res) => {
+  const { provider } = req.params;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  function send(event, data) { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); }
+  function log(level, msg)   { logger[level]('MIGRATE', msg); send('log', { message: msg, level }); }
+
+  let client;
+  try {
+    client = await buildClient(provider, req.session.providers[provider]);
+
+    const { CATEGORIES } = provider === 'cau'
+      ? require('../../cau/categories')
+      : require('../../categories');
+
+    logger.info('MIGRATE', `[${provider}] 폴더 이름 마이그레이션 시작`);
+    let totalMoved = 0;
+
+    if (provider === 'gmail') {
+      log('info', 'Gmail 레이블 목록 조회 중...');
+      const labels = await client.listLabels();
+
+      for (const cat of CATEGORIES) {
+        const oldLabel = labels.find((l) => l.name === cat.key);
+        if (!oldLabel) continue;
+
+        log('info', `  [${cat.key}] → [${cat.name}] 마이그레이션 중...`);
+        try {
+          const msgIds = await client.getMessagesInLabel(oldLabel.id);
+          const newLabelId = await client.getOrCreateLabel(cat.name);
+
+          if (msgIds.length) {
+            await client.applyLabel(msgIds, newLabelId);
+            await client.removeLabelsFromMessages(msgIds, oldLabel.id);
+            totalMoved += msgIds.length;
+          }
+
+          await client.deleteLabel(oldLabel.id);
+          log('success', `  ✓ [${cat.name}] ${msgIds.length}개 이동, 기존 레이블 삭제 완료`);
+        } catch (err) {
+          log('error', `  ✗ [${cat.name}] 실패: ${err.message}`);
+        }
+      }
+    } else {
+      log('info', '폴더 목록 조회 중...');
+      const folders = await client.listFolders();
+
+      for (const cat of CATEGORIES) {
+        if (!folders.includes(cat.key)) continue;
+
+        log('info', `  [${cat.key}] → [${cat.name}] 마이그레이션 중...`);
+        try {
+          const messages = await client.searchInFolder(cat.key, {}, 9999);
+
+          if (messages.length) {
+            await client.createFolder(cat.name);
+            await client.moveTo(messages.map((m) => m.id), cat.name);
+            totalMoved += messages.length;
+          }
+
+          await client.deleteFolder(cat.key);
+          log('success', `  ✓ [${cat.name}] ${messages.length}개 이동, [${cat.key}] 폴더 삭제 완료`);
+        } catch (err) {
+          const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
+          log('error', `  ✗ [${cat.name}] 실패: ${err.message}${detail}`);
+          try { await client.reconnect(); } catch (_) {}
+        }
+      }
+    }
+
+    logger.success('MIGRATE', `[${provider}] 마이그레이션 완료 — 총 ${totalMoved}개`);
+    log('success', `✅ 마이그레이션 완료 — 총 ${totalMoved}개 메일 이동됨`);
+    send('complete', { total: totalMoved });
+  } catch (err) {
+    logger.error('MIGRATE', `[${provider}] 마이그레이션 오류: ${err.message}`);
     send('error', { message: err.message });
   } finally {
     if (client?.disconnect) await client.disconnect().catch(() => {});
