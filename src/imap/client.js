@@ -90,6 +90,36 @@ class ImapClient {
     } finally { lock.release(); }
   }
 
+  // EXAMINE을 거치지 않고 SELECT로 바로 열어 검색+이동을 단일 잠금으로 처리
+  // EXAMINE → SELECT 전환 시 Nate 서버가 BYE를 보내는 문제를 근본적으로 회피
+  async searchAndMoveAll(sourceFolder, targetFolder, chunkSize = 50) {
+    let moved = 0;
+    const lock = await this.imap.getMailboxLock(sourceFolder); // SELECT (쓰기)
+    try {
+      const uids = await this.imap.search({ all: true }, { uid: true });
+      if (!uids.length) return 0;
+      for (let i = 0; i < uids.length; i += chunkSize) {
+        const chunk = uids.slice(i, i + chunkSize);
+        try {
+          await this.imap.messageMove(chunk, targetFolder, { uid: true });
+        } catch (moveErr) {
+          const m = `${moveErr.message || ''} ${moveErr.responseText || ''}`.toLowerCase();
+          // 대상 폴더 없음 → 생성 후 재시도 (존재하지 않는 폴더 CREATE → BYE 없음)
+          if (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such')) {
+            await this.imap.mailboxCreate(targetFolder);
+            await this.imap.messageMove(chunk, targetFolder, { uid: true });
+          } else {
+            throw moveErr;
+          }
+        }
+        moved += chunk.length;
+      }
+    } finally {
+      lock.release();
+    }
+    return moved;
+  }
+
   async getMetadata(encodedIds) {
     if (!encodedIds.length) return [];
     const results = [];
@@ -119,25 +149,29 @@ class ImapClient {
   }
 
   // 폴더 전체 메시지 메타데이터 조회
-  // mailbox.exists로 전체 수 파악 후 BATCH 단위 시퀀스 범위 fetch
-  // — Nate 등 서버별 FETCH 응답 수 제한(1000개 등) 우회
+  // UID SEARCH ALL로 먼저 전체 UID 목록을 가져온 뒤 UID 기반 FETCH
+  // → EXISTS=1000 등 서버의 시퀀스 노출 제한을 우회해 전체 메일을 처리
   async fetchAllMetadata(folder, onProgress) {
-    const BATCH   = 500;
+    const CHUNK   = 500;
     const results = [];
 
-    // 폴더 선택 → 전체 메시지 수 확인 후 즉시 해제
-    const lock0 = await this.imap.getMailboxLock(folder, { readOnly: true });
-    const total  = this.imap.mailbox?.exists ?? 0;
-    lock0.release();
+    // SELECT 모드로 SEARCH ALL → 전체 UID 목록 (EXISTS 제한과 무관하게 반환)
+    const searchLock = await this.imap.getMailboxLock(folder);
+    let allUids;
+    try {
+      allUids = await this.imap.search({ all: true }, { uid: true });
+    } finally {
+      searchLock.release();
+    }
 
-    if (total === 0) return results;
+    if (!allUids.length) return results;
 
-    for (let start = 1; start <= total; start += BATCH) {
-      const end  = Math.min(start + BATCH - 1, total);
-      const lock = await this.imap.getMailboxLock(folder, { readOnly: true });
+    for (let i = 0; i < allUids.length; i += CHUNK) {
+      const chunk = allUids.slice(i, i + CHUNK);
+      const lock  = await this.imap.getMailboxLock(folder);
       try {
-        for await (const msg of this.imap.fetch(`${start}:${end}`, { envelope: true, uid: true })) {
-          if (!msg.envelope || !msg.uid) continue; // UID 미반환 → NaN 인코딩 방지
+        for await (const msg of this.imap.fetch(chunk, { envelope: true }, { uid: true })) {
+          if (!msg.envelope || !msg.uid) continue;
           const f = msg.envelope.from?.[0];
           const fromStr = f ? (f.name ? `${f.name} <${f.address}>` : f.address) : '';
           results.push({
@@ -150,7 +184,7 @@ class ImapClient {
           });
         }
       } finally { lock.release(); }
-      if (onProgress) onProgress(end, total);
+      if (onProgress) onProgress(Math.min(i + CHUNK, allUids.length), allUids.length);
     }
 
     return results;
@@ -159,6 +193,35 @@ class ImapClient {
   async trashMessages(ids)  { return this._moveTo(ids, this._folders.TRASH); }
   async markAsSpam(ids)     { return this._moveTo(ids, this._folders.SPAM);  }
   async moveTo(ids, folder) { return this._moveTo(ids, folder); }
+
+  // createFolder를 사전에 호출하지 않고 MOVE 실패 시 TRYCREATE 패턴으로 폴더 생성
+  // 없는 폴더에만 CREATE → BYE 없음 / EXAMINE→SELECT 전환 없음
+  async moveToWithCreate(encodedIds, targetFolder) {
+    const CHUNK = 50;
+    let count = 0;
+    for (const [folder, uids] of Object.entries(groupByFolder(encodedIds))) {
+      if (folder === targetFolder) { count += uids.length; continue; }
+      for (let i = 0; i < uids.length; i += CHUNK) {
+        const chunk = uids.slice(i, i + CHUNK);
+        const lock  = await this.imap.getMailboxLock(folder);
+        try {
+          try {
+            await this.imap.messageMove(chunk, targetFolder, { uid: true });
+          } catch (moveErr) {
+            const m = `${moveErr.message || ''} ${moveErr.responseText || ''}`.toLowerCase();
+            if (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such')) {
+              await this.imap.mailboxCreate(targetFolder);
+              await this.imap.messageMove(chunk, targetFolder, { uid: true });
+            } else {
+              throw moveErr;
+            }
+          }
+          count += chunk.length;
+        } finally { lock.release(); }
+      }
+    }
+    return count;
+  }
 
   async deleteMessages(encodedIds) {
     let count = 0;

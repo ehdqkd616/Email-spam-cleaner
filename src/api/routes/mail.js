@@ -195,90 +195,115 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
 
     // Nate 등 IMAP 서버는 한 번 SELECT 시 최대 N개(보통 1000개)만 노출
     // → 분류·이동 후 재조회하면 숨어있던 이전 메일이 새로 나타남
-    // → UID로 처리 여부를 추적하며 이동된 메일이 없어질 때까지 패스를 반복
-    const processedUids = new Set();
-    const catTotals     = {};          // cat.key → 누적 이동 수
+    // Nate는 UID SEARCH도 EXISTS=1000으로 제한 → 한 번에 1000개만 보임
+    // 해결책: 미분류(광고) 메일을 임시 폴더로 옮겨 숨김 → 다음 1000개 노출 → 반복
+    // 완료 후 임시 폴더를 받은편지함으로 전량 복원
+    const TEMP_FOLDER   = '_분류임시_';
+    const catTotals     = {};
     let   totalMoved    = 0;
     let   pass          = 0;
-    const MAX_PASSES    = 100;         // 안전 상한: 최대 100 × 1000 = 10만 건
+    let   tempHasEmails = false;
+    const MAX_PASSES    = 500;
 
-    while (pass < MAX_PASSES) {
-      pass++;
+    try {
+      while (pass < MAX_PASSES) {
+        pass++;
 
-      log('info', pass === 1
-        ? '📂 받은편지함 전체 메시지 헤더 가져오는 중...'
-        : `  ↳ 패스 ${pass}: 추가 메시지 확인 중...`);
+        log('info', pass === 1
+          ? `📂 받은편지함 전체 스캔 시작 (서버 1000개 제한 → 임시 폴더 방식)`
+          : `  ↳ 패스 ${pass}: 남은 메일 스캔 중...`);
 
-      let metadatas;
-      try {
-        metadatas = await client.fetchAllMetadata('INBOX');
-      } catch (err) {
-        logger.error('CATEGORIZE', `[${provider}] 헤더 조회 실패: ${err.message}`);
-        log('error', `❌ 헤더 조회 실패: ${err.message}`);
-        send('error', { message: `헤더 조회 실패: ${err.message}` });
-        return;
-      }
-
-      if (!metadatas.length) break;
-
-      // 이미 처리한 UID 제외 — 이전 패스의 미분류 메일이 다시 보일 수 있음
-      const newMsgs = metadatas.filter(m => !processedUids.has(m.uid));
-      if (!newMsgs.length) break;
-      newMsgs.forEach(m => processedUids.add(m.uid));
-
-      logger.info('CATEGORIZE', `[${provider}] 받은편지함 ${metadatas.length}개 메시지 분석`);
-      log('info', pass === 1
-        ? `받은편지함 ${metadatas.length}개 메시지 분석 완료`
-        : `  신규 ${newMsgs.length}개 분석 (누적 ${processedUids.size}개)`);
-
-      // 광고 감지 → 카테고리 매칭
-      const buckets = {};
-      let skippedAds = 0;
-      for (const msg of newMsgs) {
-        const subject = getHeader(msg, 'Subject');
-        const from    = getHeader(msg, 'From');
-        const cat     = matchCategory(subject, from, CATEGORIES);
-        if (!cat) { skippedAds++; continue; }
-        if (!buckets[cat.key]) buckets[cat.key] = { cat, msgs: [] };
-        buckets[cat.key].msgs.push(msg);
-      }
-      if (skippedAds > 0) log('info', `  광고/미분류 제외: ${skippedAds}개`);
-
-      // 카테고리 이동
-      let movedInPass = 0;
-      let reconnectFailed = false;
-      for (const cat of CATEGORIES) {
-        const bucket = buckets[cat.key];
-        if (!bucket || !bucket.msgs.length) continue;
-
-        const folderPath = cat.name;
-        log('info', `  [${cat.name}] ${bucket.msgs.length}개 이동 중...`);
+        let metadatas;
         try {
-          await client.createFolder(folderPath);
-          await client.moveTo(bucket.msgs.map(m => m.id), folderPath);
-          movedInPass              += bucket.msgs.length;
-          totalMoved               += bucket.msgs.length;
-          catTotals[cat.key]        = (catTotals[cat.key] || 0) + bucket.msgs.length;
-          logger.success('CATEGORIZE', `[${provider}] [${cat.name}] ${bucket.msgs.length}개 이동 완료`);
-          log('success', `  ✓ [${cat.name}] ${bucket.msgs.length}개 이동 완료`);
+          metadatas = await client.fetchAllMetadata('INBOX', (done, total) => {
+            if (done === total || done % 2500 === 0) {
+              log('info', `  📧 ${done.toLocaleString()} / ${total.toLocaleString()}개 스캔됨`);
+            }
+          });
         } catch (err) {
-          const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
-          logger.error('CATEGORIZE', `[${provider}] [${cat.name}] 실패: ${err.message}${detail}`);
-          log('error', `  ✗ [${cat.name}] 실패: ${err.message}${detail}`);
+          logger.error('CATEGORIZE', `[${provider}] 헤더 조회 실패: ${err.message}`);
+          log('error', `❌ 헤더 조회 실패: ${err.message}`);
+          break;
+        }
+
+        if (!metadatas.length) break; // 받은편지함 비어있음
+
+        logger.info('CATEGORIZE', `[${provider}] 받은편지함 ${metadatas.length}개 메시지 분석`);
+        log('info', `  ${metadatas.length.toLocaleString()}개 분석 중... (누적 처리: ${(totalMoved + (tempHasEmails ? '?' : 0)).toLocaleString()}개 이동)`);
+
+        // 카테고리 매칭
+        const buckets      = {};
+        const uncategorized = [];
+        for (const msg of metadatas) {
+          const subject = getHeader(msg, 'Subject');
+          const from    = getHeader(msg, 'From');
+          const cat     = matchCategory(subject, from, CATEGORIES);
+          if (!cat) { uncategorized.push(msg); continue; }
+          if (!buckets[cat.key]) buckets[cat.key] = { cat, msgs: [] };
+          buckets[cat.key].msgs.push(msg);
+        }
+        if (uncategorized.length) log('info', `  광고/미분류: ${uncategorized.length.toLocaleString()}개`);
+
+        // 카테고리별 이동
+        let reconnectFailed = false;
+        for (const cat of CATEGORIES) {
+          const bucket = buckets[cat.key];
+          if (!bucket || !bucket.msgs.length) continue;
+
+          log('info', `  [${cat.name}] ${bucket.msgs.length}개 이동 중...`);
           try {
-            await client.reconnect();
-            logger.info('CATEGORIZE', `[${provider}] 재연결 성공`);
-          } catch (reconnErr) {
-            logger.error('CATEGORIZE', `[${provider}] 재연결 실패: ${reconnErr.message}`);
-            reconnectFailed = true;
-            break;
+            await client.moveToWithCreate(bucket.msgs.map(m => m.id), cat.name);
+            totalMoved        += bucket.msgs.length;
+            catTotals[cat.key] = (catTotals[cat.key] || 0) + bucket.msgs.length;
+            logger.success('CATEGORIZE', `[${provider}] [${cat.name}] ${bucket.msgs.length}개 이동 완료`);
+            log('success', `  ✓ [${cat.name}] ${bucket.msgs.length}개 이동 완료`);
+          } catch (err) {
+            const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
+            logger.error('CATEGORIZE', `[${provider}] [${cat.name}] 실패: ${err.message}${detail}`);
+            log('error', `  ✗ [${cat.name}] 실패: ${err.message}${detail}`);
+            try {
+              await client.reconnect();
+              logger.info('CATEGORIZE', `[${provider}] 재연결 성공`);
+            } catch (reconnErr) {
+              logger.error('CATEGORIZE', `[${provider}] 재연결 실패: ${reconnErr.message}`);
+              reconnectFailed = true;
+              break;
+            }
           }
         }
-      }
+        if (reconnectFailed) break;
 
-      if (reconnectFailed) break;
-      // 이번 패스에서 이동한 것이 없으면 숨어있던 메일도 없음 → 완료
-      if (movedInPass === 0) break;
+        // 미분류 메일을 임시 폴더로 이동해 다음 배치를 노출
+        if (uncategorized.length > 0) {
+          try {
+            log('info', `  📦 미분류 ${uncategorized.length.toLocaleString()}개 임시 보관 중...`);
+            await client.moveToWithCreate(uncategorized.map(m => m.id), TEMP_FOLDER);
+            tempHasEmails = true;
+          } catch (err) {
+            log('error', `  임시 이동 실패: ${err.message} — 중단`);
+            if (!client.usable) await client.reconnect().catch(() => {});
+            break;
+          }
+        } else {
+          // 이번 배치가 전부 분류됨 → 계속 (더 숨겨진 메일이 있을 수 있음)
+        }
+      }
+    } finally {
+      // 임시 폴더 → 받은편지함 전량 복원 (오류 여부와 무관하게 항상 실행)
+      if (tempHasEmails) {
+        log('info', '\n📬 임시 보관 메일 받은편지함으로 복원 중...');
+        try {
+          if (!client.usable) await client.reconnect();
+          const restored = await client.searchAndMoveAll(TEMP_FOLDER, 'INBOX', 200);
+          await client.deleteFolder(TEMP_FOLDER);
+          log('info', `  ↩️ ${restored.toLocaleString()}개 복원 완료`);
+          logger.info('CATEGORIZE', `[${provider}] 임시 폴더 복원 완료 — ${restored}개`);
+        } catch (err) {
+          log('error', `  ⚠️ 복원 실패: ${err.message}`);
+          log('error', `  임시 폴더 '${TEMP_FOLDER}'에 메일이 남아있습니다. 수동으로 받은편지함으로 이동해주세요.`);
+          logger.error('CATEGORIZE', `[${provider}] 복원 실패: ${err.message}`);
+        }
+      }
     }
 
     // 카테고리별 최종 결과 표시
@@ -352,28 +377,40 @@ router.get('/:provider/migrate-folders', requireAuth, async (req, res) => {
         }
       }
     } else {
-      log('info', '폴더 목록 조회 중...');
-      const folders = await client.listFolders();
-
-      for (const cat of CATEGORIES) {
-        if (!folders.includes(cat.key)) continue;
-
-        log('info', `  [${cat.key}] → [${cat.name}] 마이그레이션 중...`);
-        try {
-          const messages = await client.searchInFolder(cat.key, {}, 9999);
-
-          if (messages.length) {
-            await client.createFolder(cat.name);
-            await client.moveTo(messages.map((m) => m.id), cat.name);
-            totalMoved += messages.length;
+      // EXAMINE → SELECT 전환 시 Nate가 BYE를 보내는 문제를 근본 해결:
+      // searchAndMoveAll 로 SELECT 한 번에 검색+이동 처리
+      outerLoop: for (const cat of CATEGORIES) {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const moved = await client.searchAndMoveAll(cat.key, cat.name);
+            await client.deleteFolder(cat.key);
+            totalMoved += moved;
+            if (moved > 0) {
+              log('success', `  ✓ [${cat.key}] → [${cat.name}] ${moved}개 이동, 폴더 삭제 완료`);
+            }
+            break;
+          } catch (err) {
+            const errMsg = `${err.message || ''} ${err.responseText || ''}`.toLowerCase();
+            // 원본 폴더 없음 (이미 삭제/마이그레이션 완료) — 연결이 끊겼으면 조용히 재연결
+            if (errMsg.includes('nonexistent') || errMsg.includes('does not exist') ||
+                errMsg.includes('no such') || errMsg.includes('not found')) {
+              if (!client.usable) {
+                await new Promise((r) => setTimeout(r, 500));
+                await client.reconnect().catch(() => {});
+              }
+              break;
+            }
+            const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
+            log('error', `  ✗ [${cat.key}] 실패 (${attempt}/2): ${err.message}${detail}`);
+            if (attempt < 2) {
+              await new Promise((r) => setTimeout(r, 1000));
+              try { await client.reconnect(); }
+              catch (reconnErr) {
+                log('error', `  재연결 실패: ${reconnErr.message} — 중단`);
+                break outerLoop;
+              }
+            }
           }
-
-          await client.deleteFolder(cat.key);
-          log('success', `  ✓ [${cat.name}] ${messages.length}개 이동, [${cat.key}] 폴더 삭제 완료`);
-        } catch (err) {
-          const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
-          log('error', `  ✗ [${cat.name}] 실패: ${err.message}${detail}`);
-          try { await client.reconnect(); } catch (_) {}
         }
       }
     }
