@@ -177,12 +177,6 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
   function send(event, data) { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); }
   function log(level, msg)   { logger[level]('CATEGORIZE', msg); send('log', { message: msg, level }); }
 
-  function getHeader(msg, name) {
-    return msg.payload?.headers?.find(
-      (h) => h.name.toLowerCase() === name.toLowerCase()
-    )?.value || '';
-  }
-
   let client;
   try {
     client = await buildClient(provider, req.session.providers[provider]);
@@ -193,12 +187,11 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
 
     logger.info('CATEGORIZE', `[${provider}] 자동 분류 시작`);
 
-    // Nate 등 IMAP 서버는 한 번 SELECT 시 최대 N개(보통 1000개)만 노출
-    // → 분류·이동 후 재조회하면 숨어있던 이전 메일이 새로 나타남
-    // Nate는 UID SEARCH도 EXISTS=1000으로 제한 → 한 번에 1000개만 보임
-    // 해결책: 미분류(광고) 메일을 임시 폴더로 옮겨 숨김 → 다음 1000개 노출 → 반복
-    // 완료 후 임시 폴더를 받은편지함으로 전량 복원
-    const TEMP_FOLDER   = '_분류임시_';
+    // Nate 등 IMAP: UID SEARCH ALL도 1000개 창(window)으로 제한
+    // processInboxBatch: SEARCH + FETCH + MOVE를 단일 SELECT 락 안에서 처리
+    // → 락 해제 후 Nate가 BYE를 보내는 레이스 컨디션 방지
+    // 미분류 → CATEGORIZE_TEMP → 창 전진 → 반복 → 완료 후 임시폴더 복원
+    const TEMP_FOLDER   = 'CATEGORIZE_TEMP';
     const catTotals     = {};
     let   totalMoved    = 0;
     let   pass          = 0;
@@ -210,82 +203,53 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
         pass++;
 
         log('info', pass === 1
-          ? `📂 받은편지함 전체 스캔 시작 (서버 1000개 제한 → 임시 폴더 방식)`
-          : `  ↳ 패스 ${pass}: 남은 메일 스캔 중...`);
+          ? `📂 받은편지함 스캔 시작 (최대 1,000개씩 처리)`
+          : `  ↳ 패스 ${pass}: 다음 메시지 묶음 처리 중...`);
 
-        let metadatas;
+        // SEARCH + FETCH + MOVE 전부 단일 SELECT 락 안에서 처리
+        let batchResult;
         try {
-          metadatas = await client.fetchAllMetadata('INBOX', (done, total) => {
-            if (done === total || done % 2500 === 0) {
-              log('info', `  📧 ${done.toLocaleString()} / ${total.toLocaleString()}개 스캔됨`);
+          batchResult = await client.processInboxBatch(
+            (subject, from) => {
+              const cat = matchCategory(subject, from, CATEGORIES);
+              return cat ? cat.key : null;
+            },
+            TEMP_FOLDER,
+            (done, total) => {
+              if (done === total || done % 500 === 0)
+                log('info', `  📧 ${done.toLocaleString()} / ${total.toLocaleString()}개 스캔됨`);
             }
-          });
+          );
         } catch (err) {
-          logger.error('CATEGORIZE', `[${provider}] 헤더 조회 실패: ${err.message}`);
-          log('error', `❌ 헤더 조회 실패: ${err.message}`);
-          break;
-        }
-
-        if (!metadatas.length) break; // 받은편지함 비어있음
-
-        logger.info('CATEGORIZE', `[${provider}] 받은편지함 ${metadatas.length}개 메시지 분석`);
-        log('info', `  ${metadatas.length.toLocaleString()}개 분석 중... (누적 처리: ${(totalMoved + (tempHasEmails ? '?' : 0)).toLocaleString()}개 이동)`);
-
-        // 카테고리 매칭
-        const buckets      = {};
-        const uncategorized = [];
-        for (const msg of metadatas) {
-          const subject = getHeader(msg, 'Subject');
-          const from    = getHeader(msg, 'From');
-          const cat     = matchCategory(subject, from, CATEGORIES);
-          if (!cat) { uncategorized.push(msg); continue; }
-          if (!buckets[cat.key]) buckets[cat.key] = { cat, msgs: [] };
-          buckets[cat.key].msgs.push(msg);
-        }
-        if (uncategorized.length) log('info', `  광고/미분류: ${uncategorized.length.toLocaleString()}개`);
-
-        // 카테고리별 이동
-        let reconnectFailed = false;
-        for (const cat of CATEGORIES) {
-          const bucket = buckets[cat.key];
-          if (!bucket || !bucket.msgs.length) continue;
-
-          log('info', `  [${cat.name}] ${bucket.msgs.length}개 이동 중...`);
+          logger.error('CATEGORIZE', `[${provider}] 배치 처리 실패: ${err.message}`);
+          log('error', `❌ 배치 처리 실패: ${err.message}`);
           try {
-            await client.moveToWithCreate(bucket.msgs.map(m => m.id), cat.name);
-            totalMoved        += bucket.msgs.length;
-            catTotals[cat.key] = (catTotals[cat.key] || 0) + bucket.msgs.length;
-            logger.success('CATEGORIZE', `[${provider}] [${cat.name}] ${bucket.msgs.length}개 이동 완료`);
-            log('success', `  ✓ [${cat.name}] ${bucket.msgs.length}개 이동 완료`);
-          } catch (err) {
-            const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
-            logger.error('CATEGORIZE', `[${provider}] [${cat.name}] 실패: ${err.message}${detail}`);
-            log('error', `  ✗ [${cat.name}] 실패: ${err.message}${detail}`);
-            try {
-              await client.reconnect();
-              logger.info('CATEGORIZE', `[${provider}] 재연결 성공`);
-            } catch (reconnErr) {
-              logger.error('CATEGORIZE', `[${provider}] 재연결 실패: ${reconnErr.message}`);
-              reconnectFailed = true;
-              break;
-            }
-          }
-        }
-        if (reconnectFailed) break;
-
-        // 미분류 메일을 임시 폴더로 이동해 다음 배치를 노출
-        if (uncategorized.length > 0) {
-          try {
-            log('info', `  📦 미분류 ${uncategorized.length.toLocaleString()}개 임시 보관 중...`);
-            await client.moveToWithCreate(uncategorized.map(m => m.id), TEMP_FOLDER);
-            tempHasEmails = true;
-          } catch (err) {
-            log('error', `  임시 이동 실패: ${err.message} — 중단`);
-            if (!client.usable) await client.reconnect().catch(() => {});
+            await client.reconnect();
+            logger.info('CATEGORIZE', `[${provider}] 재연결 성공 — 패스 재시도`);
+            continue;
+          } catch (reconnErr) {
+            logger.error('CATEGORIZE', `[${provider}] 재연결 실패: ${reconnErr.message}`);
             break;
           }
-        } else {
-          // 이번 배치가 전부 분류됨 → 계속 (더 숨겨진 메일이 있을 수 있음)
+        }
+
+        if (batchResult.total === 0) break; // 받은편지함 비어있음
+
+        logger.info('CATEGORIZE', `[${provider}] 받은편지함 ${batchResult.total}개 처리 완료`);
+
+        for (const cat of CATEGORIES) {
+          const uids = batchResult.catUids[cat.key];
+          if (uids?.length) {
+            totalMoved        += uids.length;
+            catTotals[cat.key] = (catTotals[cat.key] || 0) + uids.length;
+            logger.success('CATEGORIZE', `[${provider}] [${cat.name}] ${uids.length}개 이동 완료`);
+            log('success', `  ✓ [${cat.name}] ${uids.length}개 이동 완료`);
+          }
+        }
+
+        if (batchResult.tempCount > 0) {
+          log('info', `  📦 미분류 ${batchResult.tempCount.toLocaleString()}개 임시 보관`);
+          tempHasEmails = true;
         }
       }
     } finally {
