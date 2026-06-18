@@ -187,11 +187,11 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
 
     logger.info('CATEGORIZE', `[${provider}] 자동 분류 시작`);
 
-    // Phase1 = INBOX→TEMP (MOVE 1:*, SEARCH 없음, BYE 방지)
+    // Phase0 = CATEGORIZE_TEMP 구조 복구 (RENAME → INBOX.분류임시)
+    // Phase1 = INBOX→TEMP (MOVE 1:*, SEARCH 없음)
     // Phase2 = TEMP에서 FETCH+JS matchFn 분류+MOVE
-    //   Nate IMAP SEARCH는 한국어 리터럴에서 "Command failed" → SEARCH 완전 제거
-    // INBOX 서브폴더로 변경: 최상위 사용자 폴더 SELECT를 Nate가 거부하는 문제 우회
     const TEMP_FOLDER   = 'INBOX.분류임시';
+    const OLD_TEMP      = 'CATEGORIZE_TEMP'; // 이전 버전에서 사용하던 최상위 임시 폴더
     const catTotals     = {};
     let   totalMoved    = 0;
     let   tempHasEmails = false;
@@ -203,7 +203,32 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
     };
 
     try {
-      // ── Phase 1: INBOX → CATEGORIZE_TEMP ──
+      // ── Phase 0: 서버 폴더 목록 확인 + CATEGORIZE_TEMP 복구 ──
+      let folders = [];
+      try {
+        folders = await client.listFolders();
+        log('info', `📋 서버 폴더 목록: ${folders.join(', ')}`);
+      } catch (err) {
+        log('error', `  폴더 목록 조회 실패: ${err.message}`);
+      }
+
+      // 이전 버전 임시 폴더(CATEGORIZE_TEMP)가 있고 INBOX.분류임시가 없으면 RENAME으로 복구
+      const hasOldTemp  = folders.some(f => f === OLD_TEMP || f.endsWith('/' + OLD_TEMP));
+      const hasNewTemp  = folders.some(f => f === TEMP_FOLDER || f.includes('분류임시'));
+      if (hasOldTemp && !hasNewTemp) {
+        log('info', `🔄 ${OLD_TEMP} → ${TEMP_FOLDER} 복구 중...`);
+        try {
+          await client.renameMailbox(OLD_TEMP, TEMP_FOLDER);
+          log('info', `  ✅ 복구 완료 — 이전 임시 폴더 이름 변경 성공`);
+          try { await client.reconnect(); } catch (_) {}
+        } catch (err) {
+          log('error', `  ⚠️ RENAME 실패: ${err.message} — Phase 1에서 INBOX 재확인`);
+        }
+      } else if (hasOldTemp && hasNewTemp) {
+        log('info', `  양쪽 임시 폴더 모두 존재: ${OLD_TEMP}, ${TEMP_FOLDER}`);
+      }
+
+      // ── Phase 1: INBOX → INBOX.분류임시 ──
       log('info', '📂 Phase 1: 받은편지함 → 임시 폴더 이동 중...');
       let drained = 0;
       try {

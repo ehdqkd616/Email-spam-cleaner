@@ -84,6 +84,10 @@ class ImapClient {
     return list.map((f) => f.path);
   }
 
+  async renameMailbox(oldPath, newPath) {
+    return this.imap.mailboxRename(oldPath, newPath);
+  }
+
   async searchInFolder(folder, criteria, limit = 5000) {
     const lock = await this.imap.getMailboxLock(folder, { readOnly: true });
     try {
