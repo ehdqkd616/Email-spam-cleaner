@@ -187,86 +187,123 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
 
     logger.info('CATEGORIZE', `[${provider}] 자동 분류 시작`);
 
-    // Nate 등 IMAP: UID SEARCH ALL도 1000개 창(window)으로 제한
-    // processInboxBatch: SEARCH + FETCH + MOVE를 단일 SELECT 락 안에서 처리
-    // → 락 해제 후 Nate가 BYE를 보내는 레이스 컨디션 방지
-    // 미분류 → CATEGORIZE_TEMP → 창 전진 → 반복 → 완료 후 임시폴더 복원
-    const TEMP_FOLDER   = 'CATEGORIZE_TEMP';
+    // Phase1 = INBOX→TEMP (MOVE 1:*, SEARCH 없음, BYE 방지)
+    // Phase2 = TEMP에서 FETCH+JS matchFn 분류+MOVE
+    //   Nate IMAP SEARCH는 한국어 리터럴에서 "Command failed" → SEARCH 완전 제거
+    // INBOX 서브폴더로 변경: 최상위 사용자 폴더 SELECT를 Nate가 거부하는 문제 우회
+    const TEMP_FOLDER   = 'INBOX.분류임시';
     const catTotals     = {};
     let   totalMoved    = 0;
-    let   pass          = 0;
     let   tempHasEmails = false;
-    const MAX_PASSES    = 500;
+
+    // JS matchFn: IMAP SEARCH 대신 FETCH한 envelope을 직접 매칭
+    const matchFn = (subject, from) => {
+      const cat = matchCategory(subject, from, CATEGORIES);
+      return cat ? cat.name : null;
+    };
 
     try {
-      while (pass < MAX_PASSES) {
-        pass++;
+      // ── Phase 1: INBOX → CATEGORIZE_TEMP ──
+      log('info', '📂 Phase 1: 받은편지함 → 임시 폴더 이동 중...');
+      let drained = 0;
+      try {
+        drained = await client.drainInboxToTemp(TEMP_FOLDER, (n) =>
+          log('info', `  📦 ${n.toLocaleString()}개 임시 이동 완료`)
+        );
+        log('info', `  총 ${drained.toLocaleString()}개 임시 폴더로 이동`);
+      } catch (err) {
+        log('error', `❌ INBOX 이동 실패: ${err.message}`);
+      }
 
-        log('info', pass === 1
-          ? `📂 받은편지함 스캔 시작 (최대 1,000개씩 처리)`
-          : `  ↳ 패스 ${pass}: 다음 메시지 묶음 처리 중...`);
+      // Phase 1 후 반드시 재연결: INBOX SELECT 상태에서 TEMP 폴더 전환 시 Nate BYE 방지
+      try { await client.reconnect(); } catch (_) {}
 
-        // SEARCH + FETCH + MOVE 전부 단일 SELECT 락 안에서 처리
-        let batchResult;
+      // TEMP 메일 수 확인 (진단용 로그)
+      let tempCount = 0;
+      try {
+        tempCount = await client.getMailboxExists(TEMP_FOLDER);
+        log('info', `  임시 폴더 메일 수: ${tempCount.toLocaleString()}개`);
+      } catch (err) {
+        const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
+        log('error', `  임시 폴더 확인 실패: ${err.message}${detail}`);
+        // tempCount=0이어도 Phase 2 진행 (TEMP에 메일이 있을 수 있음)
+      }
+      tempHasEmails = true; // 항상 Phase 2·복원 시도 (TEMP 비어있으면 FETCH가 0 반환하고 즉시 종료)
+
+      // ── Phase 2: CATEGORIZE_TEMP FETCH → matchFn → MOVE ──
+      log('info', '📂 Phase 2: 임시 폴더에서 카테고리 분류 중 (FETCH 방식)...');
+      const MAX_PASSES = 60;
+      let consecutiveLockFails = 0;
+
+      for (let pass = 0; pass < MAX_PASSES; pass++) {
+        let fetchResult;
         try {
-          batchResult = await client.processInboxBatch(
-            (subject, from) => {
-              const cat = matchCategory(subject, from, CATEGORIES);
-              return cat ? cat.key : null;
-            },
-            TEMP_FOLDER,
-            (done, total) => {
-              if (done === total || done % 500 === 0)
-                log('info', `  📧 ${done.toLocaleString()} / ${total.toLocaleString()}개 스캔됨`);
-            }
-          );
+          if (!client.usable) await client.reconnect();
+          fetchResult = await client.fetchFolderClassified(TEMP_FOLDER, matchFn, (n) => {
+            if (n % 1000 === 0) log('info', `  📧 ${n.toLocaleString()}개 조회 중...`);
+          });
+          consecutiveLockFails = 0;
         } catch (err) {
-          logger.error('CATEGORIZE', `[${provider}] 배치 처리 실패: ${err.message}`);
-          log('error', `❌ 배치 처리 실패: ${err.message}`);
+          // getMailboxLock 실패: 폴더 없음 또는 연결 불가
+          const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
+          log('error', `❌ FETCH 잠금 실패 (${pass + 1}회): ${err.message}${detail}`);
+          consecutiveLockFails++;
+          if (consecutiveLockFails >= 3) break; // 3회 연속 잠금 실패 → TEMP 없음
+          try { await client.reconnect(); } catch (_) {}
+          continue;
+        }
+        if (fetchResult.error) log('error', `⚠️ FETCH 중단: ${fetchResult.error.message}`);
+
+        const { buckets, total, error: fetchErr } = fetchResult;
+        const catCount = Object.values(buckets).reduce((a, arr) => a + arr.length, 0);
+        log('info', `  조회 ${total.toLocaleString()}개, 분류 대상 ${catCount.toLocaleString()}개`);
+
+        if (catCount > 0) {
           try {
-            await client.reconnect();
-            logger.info('CATEGORIZE', `[${provider}] 재연결 성공 — 패스 재시도`);
+            if (!client.usable) await client.reconnect();
+            const moveResult = await client.moveCategorizedFromFolder(TEMP_FOLDER, buckets);
+            for (const [folderName, count] of Object.entries(moveResult.catMoved)) {
+              const cat  = CATEGORIES.find(c => c.name === folderName);
+              totalMoved += count;
+              catTotals[cat?.key || folderName] = (catTotals[cat?.key || folderName] || 0) + count;
+              log('success', `  ✓ [${folderName}] ${count}개 이동`);
+            }
+          } catch (moveErr) {
+            log('error', `  ⚠️ MOVE 실패: ${moveErr.message}`);
+            try { await client.reconnect(); } catch (_) {}
             continue;
-          } catch (reconnErr) {
-            logger.error('CATEGORIZE', `[${provider}] 재연결 실패: ${reconnErr.message}`);
-            break;
           }
         }
 
-        if (batchResult.total === 0) break; // 받은편지함 비어있음
-
-        logger.info('CATEGORIZE', `[${provider}] 받은편지함 ${batchResult.total}개 처리 완료`);
-
-        for (const cat of CATEGORIES) {
-          const uids = batchResult.catUids[cat.key];
-          if (uids?.length) {
-            totalMoved        += uids.length;
-            catTotals[cat.key] = (catTotals[cat.key] || 0) + uids.length;
-            logger.success('CATEGORIZE', `[${provider}] [${cat.name}] ${uids.length}개 이동 완료`);
-            log('success', `  ✓ [${cat.name}] ${uids.length}개 이동 완료`);
-          }
-        }
-
-        if (batchResult.tempCount > 0) {
-          log('info', `  📦 미분류 ${batchResult.tempCount.toLocaleString()}개 임시 보관`);
-          tempHasEmails = true;
+        if (catCount === 0 && !fetchErr) break; // FETCH 완료 + 분류 대상 없음 → 완료
+        if (fetchErr) {
+          try { await client.reconnect(); } catch (_) {}
         }
       }
     } finally {
-      // 임시 폴더 → 받은편지함 전량 복원 (오류 여부와 무관하게 항상 실행)
-      if (tempHasEmails) {
-        log('info', '\n📬 임시 보관 메일 받은편지함으로 복원 중...');
+      // 미분류 메일 INBOX 복원 (TEMP 없거나 비어있으면 복원도 0건 → 정상)
+      log('info', '\n📬 임시 보관 메일 받은편지함으로 복원 중...');
+      try {
+        if (!client.usable) await client.reconnect();
+        let restored;
         try {
-          if (!client.usable) await client.reconnect();
-          const restored = await client.searchAndMoveAll(TEMP_FOLDER, 'INBOX', 200);
-          await client.deleteFolder(TEMP_FOLDER);
+          restored = await client.searchAndMoveAll(TEMP_FOLDER, 'INBOX', 200);
+        } catch (err) {
+          log('error', `  복원 1차 실패: ${err.message}`);
+          await client.reconnect();
+          restored = await client.searchAndMoveAll(TEMP_FOLDER, 'INBOX', 200);
+        }
+        if (restored > 0) {
+          try { await client.deleteFolder(TEMP_FOLDER); } catch (_) {}
           log('info', `  ↩️ ${restored.toLocaleString()}개 복원 완료`);
           logger.info('CATEGORIZE', `[${provider}] 임시 폴더 복원 완료 — ${restored}개`);
-        } catch (err) {
-          log('error', `  ⚠️ 복원 실패: ${err.message}`);
-          log('error', `  임시 폴더 '${TEMP_FOLDER}'에 메일이 남아있습니다. 수동으로 받은편지함으로 이동해주세요.`);
-          logger.error('CATEGORIZE', `[${provider}] 복원 실패: ${err.message}`);
+        } else {
+          log('info', `  복원할 미분류 메일 없음`);
         }
+      } catch (err) {
+        log('error', `  ⚠️ 복원 실패: ${err.message}`);
+        log('error', `  임시 폴더 '${TEMP_FOLDER}'에 메일이 남아있습니다. 수동으로 받은편지함으로 이동해주세요.`);
+        logger.error('CATEGORIZE', `[${provider}] 복원 실패: ${err.message}`);
       }
     }
 
@@ -281,7 +318,7 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
     if (historyResults.length > 0) history.addRecord(provider, historyResults);
 
     logger.success('CATEGORIZE', `[${provider}] 자동 분류 완료 — 총 ${totalMoved}개`);
-    log('success', `✅ 총 ${totalMoved}개 메일 분류 완료 (${pass}회 패스)`);
+    log('success', `✅ 총 ${totalMoved}개 메일 분류 완료`);
     send('complete', { total: totalMoved });
   } catch (err) {
     logger.error('CATEGORIZE', `[${provider}] 분류 오류: ${err.message}`);

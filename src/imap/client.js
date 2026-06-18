@@ -70,8 +70,11 @@ class ImapClient {
   async getProfile() { return { emailAddress: this._email }; }
 
   // 연결이 끊어진 경우 ImapFlow 인스턴스를 재생성하여 재연결
+  // close()로 TCP 소켓을 즉시 종료 → Nate가 중복 세션으로 거부하는 문제 방지
   async reconnect() {
     try { await this.imap.logout(); } catch (_) {}
+    try { this.imap.close();        } catch (_) {}
+    await new Promise(r => setTimeout(r, 2000)); // Nate 서버 세션 정리 대기
     this._createImap();
     await this.imap.connect();
   }
@@ -161,7 +164,9 @@ class ImapClient {
     const lock = await this.imap.getMailboxLock(folder); // SELECT (단일 잠금)
     try {
       const allUids = await this.imap.search({ all: true }, { uid: true });
+      if (!allUids.length) { if (onProgress) onProgress(0, 0); return results; }
 
+      // 청크로 나눠 FETCH — UID 목록이 비연속적이면 단일 FETCH 명령어가 너무 길어져 Nate가 거부
       for (let i = 0; i < allUids.length; i += CHUNK) {
         const chunk = allUids.slice(i, i + CHUNK);
         for await (const msg of this.imap.fetch(chunk, { envelope: true }, { uid: true })) {
@@ -275,8 +280,251 @@ class ImapClient {
     return { catUids, tempCount, total };
   }
 
+  // Phase 1: INBOX → tempFolder, SEARCH/FETCH 없이 시퀀스 번호 MOVE만 사용
+  // Nate는 UIDPLUS MOVE를 사용해 EXPUNGE가 오지 않아 mailbox.exists가 stale 유지됨
+  // → messageMove 반환값의 uidMap.size로 실제 이동 수 확인
+  async drainInboxToTemp(tempFolder, onProgress) {
+    let totalMoved      = 0;
+    let tempCreated     = false;
+    let consecutiveFails = 0;
+    const MAX_PASSES    = 300;
+    const MAX_FAILS     = 10;
+
+    for (let pass = 0; pass < MAX_PASSES; pass++) {
+      try {
+        if (!this.usable) await this.reconnect();
+
+        const lock = await this.imap.getMailboxLock('INBOX');
+        let moveResult;
+        let before = 0;
+        try {
+          before = this.imap.mailbox.exists;
+          if (before === 0) { lock.release(); break; }
+
+          try {
+            moveResult = await this.imap.messageMove('1:*', tempFolder);
+          } catch (err) {
+            const m = (err.message || '').toLowerCase();
+            if (!tempCreated && (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such'))) {
+              await this.imap.mailboxCreate(tempFolder);
+              tempCreated = true;
+              moveResult = await this.imap.messageMove('1:*', tempFolder);
+            } else throw err;
+          }
+
+          // moveResult === false: resolveRange가 false 반환 (mailbox가 비어있음을 이미 알고있음)
+          // moveResult.uidMap.size === 0: UIDPLUS MOVE에서 아무것도 이동 안됨 → INBOX 비어있음
+          const movedCount = moveResult === false ? 0 : (moveResult?.uidMap?.size ?? null);
+          if (movedCount === 0) { lock.release(); break; }
+
+          totalMoved += movedCount ?? before; // UIDPLUS: 정확한 수, 아니면 SELECT 시점의 수
+          if (onProgress) onProgress(totalMoved);
+          consecutiveFails = 0;
+        } finally {
+          try { lock.release(); } catch (_) {}
+        }
+
+        // UIDPLUS 미지원 폴백: 락 해제 후 재SELECT로 INBOX 잔여 수 확인
+        if (moveResult !== false && moveResult?.uidMap == null) {
+          const checkLock = await this.imap.getMailboxLock('INBOX');
+          try {
+            if (this.imap.mailbox.exists === 0) { checkLock.release(); break; }
+          } finally {
+            try { checkLock.release(); } catch (_) {}
+          }
+        }
+
+        await new Promise(r => setTimeout(r, 300));
+      } catch (err) {
+        consecutiveFails++;
+        if (consecutiveFails > MAX_FAILS) break;
+        await new Promise(r => setTimeout(r, 1000));
+        try { await this.reconnect(); } catch (_) {}
+        pass--;
+      }
+    }
+    return totalMoved;
+  }
+
+  // 폴더 메일 수 반환 (TEMP 잔여 메일 확인용)
+  async getMailboxExists(folder) {
+    const lock = await this.imap.getMailboxLock(folder);
+    try {
+      return this.imap.mailbox.exists;
+    } finally {
+      lock.release();
+    }
+  }
+
+  // Phase 2: TEMP 폴더에서 FETCH → JavaScript matchFn으로 분류 → MOVE
+  // SEARCH 대신 FETCH 사용 (Nate SEARCH는 한국어 리터럴에서 Command failed)
+  // FETCH가 non-INBOX에서도 BYE를 트리거하는 경우 대비: buckets 반환 후 caller가 reconnect+MOVE
+  async fetchFolderClassified(folder, matchFn, onProgress) {
+    const buckets = {};
+    let total      = 0;
+    let fetchError = null;
+
+    const lock = await this.imap.getMailboxLock(folder);
+    try {
+      for await (const msg of this.imap.fetch('1:*', { envelope: true }, { uid: true })) {
+        if (!msg.envelope || !msg.uid) continue;
+        total++;
+        const f       = msg.envelope.from?.[0];
+        const fromStr = f ? (f.name ? `${f.name} <${f.address}>` : f.address) : '';
+        const target  = matchFn(msg.envelope.subject || '', fromStr);
+        if (target) {
+          if (!buckets[target]) buckets[target] = [];
+          buckets[target].push(msg.uid);
+        }
+        if (onProgress) onProgress(total);
+      }
+    } catch (err) {
+      fetchError = err;
+      // 연결 끊김이어도 지금까지 수집한 buckets는 유효
+    } finally {
+      try { lock.release(); } catch (_) {}
+    }
+    return { buckets, total, error: fetchError };
+  }
+
+  // TEMP 폴더에서 카테고리별로 분류된 UID를 각 카테고리 폴더로 MOVE
+  // 미분류 메일은 TEMP에 그대로 남김 (나중에 searchAndMoveAll로 INBOX 복원)
+  async moveCategorizedFromFolder(folder, buckets) {
+    const CHUNK  = 50;
+    const result = { catMoved: {} };
+    const catCreated = {};
+
+    const entries = Object.entries(buckets).filter(([, uids]) => uids.length > 0);
+    if (!entries.length) return result;
+
+    if (!this.usable) await this.reconnect();
+    const lock = await this.imap.getMailboxLock(folder);
+    try {
+      for (const [targetFolder, uids] of entries) {
+        for (let i = 0; i < uids.length; i += CHUNK) {
+          const chunk = uids.slice(i, i + CHUNK);
+          try {
+            await this.imap.messageMove(chunk, targetFolder, { uid: true });
+          } catch (err) {
+            const m = `${err.message || ''} ${err.responseText || ''}`.toLowerCase();
+            if (!catCreated[targetFolder] && (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such'))) {
+              await this.imap.mailboxCreate(targetFolder);
+              catCreated[targetFolder] = true;
+              await this.imap.messageMove(chunk, targetFolder, { uid: true });
+            } else throw err;
+          }
+          result.catMoved[targetFolder] = (result.catMoved[targetFolder] || 0) + chunk.length;
+        }
+      }
+    } finally {
+      lock.release();
+    }
+    return result;
+  }
+
+  // FETCH 전용 — UID + 분류 결과를 메모리에 수집
+  // Nate는 FETCH 완료 후 BYE를 보냄 → 이 메서드 호출 후 연결이 죽어있음
+  async fetchInboxClassified(matchFn, onProgress) {
+    const buckets  = {};
+    const tempUids = [];
+    let   total    = 0;
+
+    const lock = await this.imap.getMailboxLock('INBOX');
+    try {
+      for await (const msg of this.imap.fetch('1:*', { envelope: true }, { uid: true })) {
+        if (!msg.envelope || !msg.uid) continue;
+        total++;
+        const f       = msg.envelope.from?.[0];
+        const fromStr = f ? (f.name ? `${f.name} <${f.address}>` : f.address) : '';
+        const target  = matchFn(msg.envelope.subject || '', fromStr);
+        if (target) {
+          if (!buckets[target]) buckets[target] = [];
+          buckets[target].push(msg.uid);
+        } else {
+          tempUids.push(msg.uid);
+        }
+      }
+    } finally {
+      lock.release();
+    }
+
+    if (onProgress) onProgress(total);
+    return { buckets, tempUids, total };
+  }
+
+  // MOVE 전용 — fetchInboxClassified가 수집한 데이터를 이동
+  // reconnect() 후 새 연결에서 호출해야 함
+  async moveClassified(buckets, tempUids, tempFolder) {
+    const CHUNK      = 50;
+    const result     = { catMoved: {}, tempMoved: 0 };
+    const catCreated = {};
+    let   tempCreated = false;
+
+    const lock = await this.imap.getMailboxLock('INBOX');
+    try {
+      for (const [folder, uids] of Object.entries(buckets)) {
+        for (let i = 0; i < uids.length; i += CHUNK) {
+          const chunk = uids.slice(i, i + CHUNK);
+          try {
+            await this.imap.messageMove(chunk, folder, { uid: true });
+          } catch (err) {
+            const m = `${err.message || ''} ${err.responseText || ''}`.toLowerCase();
+            if (!catCreated[folder] && (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such'))) {
+              await this.imap.mailboxCreate(folder);
+              catCreated[folder] = true;
+              await this.imap.messageMove(chunk, folder, { uid: true });
+            } else throw err;
+          }
+          result.catMoved[folder] = (result.catMoved[folder] || 0) + chunk.length;
+        }
+      }
+
+      for (let i = 0; i < tempUids.length; i += CHUNK) {
+        const chunk = tempUids.slice(i, i + CHUNK);
+        try {
+          await this.imap.messageMove(chunk, tempFolder, { uid: true });
+        } catch (err) {
+          const m = `${err.message || ''} ${err.responseText || ''}`.toLowerCase();
+          if (!tempCreated && (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such'))) {
+            await this.imap.mailboxCreate(tempFolder);
+            tempCreated = true;
+            await this.imap.messageMove(chunk, tempFolder, { uid: true });
+          } else throw err;
+        }
+        result.tempMoved += chunk.length;
+      }
+    } finally {
+      lock.release();
+    }
+
+    return result;
+  }
+
   async moveToWithCreate(encodedIds, targetFolder) {
-    return this._moveTo(encodedIds, targetFolder);
+    const CHUNK = 50;
+    let count = 0;
+    for (const [folder, uids] of Object.entries(groupByFolder(encodedIds))) {
+      if (folder === targetFolder) { count += uids.length; continue; }
+      const lock = await this.imap.getMailboxLock(folder);
+      try {
+        let targetCreated = false;
+        for (let i = 0; i < uids.length; i += CHUNK) {
+          const chunk = uids.slice(i, i + CHUNK);
+          try {
+            await this.imap.messageMove(chunk, targetFolder, { uid: true });
+          } catch (moveErr) {
+            const m = `${moveErr.message || ''} ${moveErr.responseText || ''}`.toLowerCase();
+            if (!targetCreated && (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such'))) {
+              await this.imap.mailboxCreate(targetFolder);
+              targetCreated = true;
+              await this.imap.messageMove(chunk, targetFolder, { uid: true });
+            } else throw moveErr;
+          }
+          count += chunk.length;
+        }
+      } finally { lock.release(); }
+    }
+    return count;
   }
 
   async deleteMessages(encodedIds) {

@@ -48,11 +48,11 @@ router.get('/gmail/callback', async (req, res) => {
     const profile = await client.getProfile();
     setProvider(req, 'gmail', { email: profile.emailAddress });
     logger.success('AUTH', `Gmail 로그인 완료 (${profile.emailAddress})`);
-    const redirectUrl = `${process.env.CLIENT_URL || 'http://localhost:5173'}?provider=gmail&status=success`;
+    const redirectUrl = `${process.env.CLIENT_URL || 'http://localhost:5174'}?provider=gmail&status=success`;
     res.redirect(redirectUrl);
   } catch (err) {
     logger.error('AUTH', `Gmail 로그인 실패: ${err.message}`);
-    const redirectUrl = `${process.env.CLIENT_URL || 'http://localhost:5173'}?provider=gmail&status=error&msg=${encodeURIComponent(err.message)}`;
+    const redirectUrl = `${process.env.CLIENT_URL || 'http://localhost:5174'}?provider=gmail&status=error&msg=${encodeURIComponent(err.message)}`;
     res.redirect(redirectUrl);
   }
 });

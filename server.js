@@ -11,7 +11,7 @@ const logsRouter = require('./src/api/routes/logs');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
-const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5174';
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 // ── 미들웨어 ───────────────────────────────────────────────────────
