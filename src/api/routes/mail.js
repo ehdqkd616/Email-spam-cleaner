@@ -25,7 +25,19 @@ async function buildClient(provider, sessionData) {
     case 'nate': {
       const { NateClient } = require('../../nate/client');
       client = new NateClient({ user: sessionData.user, password: sessionData.password });
-      await client.connect();
+      // 직전 auth 연결 해제 후 Nate 세션 정리 대기 — 즉시 연결 시 Unexpected close 발생
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await client.connect();
+          break;
+        } catch (err) {
+          if (attempt === 3) throw err;
+          logger.warn('SYSTEM', `[nate] 연결 실패 (${attempt}회), 3초 후 재시도...`);
+          try { client.imap.close(); } catch (_) {}
+          await new Promise(r => setTimeout(r, 3000));
+          client = new NateClient({ user: sessionData.user, password: sessionData.password });
+        }
+      }
       break;
     }
     case 'cau': {
@@ -202,8 +214,17 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
       return cat ? cat.name : null;
     };
 
+    // 안정적인 재연결 헬퍼 (최대 3회 재시도)
+    const safeReconnect = async () => {
+      for (let i = 0; i < 3; i++) {
+        try { await client.reconnect(); return true; } catch (_) {}
+        await new Promise(r => setTimeout(r, 2000));
+      }
+      return false;
+    };
+
     try {
-      // ── Phase 0: 서버 폴더 목록 확인 + CATEGORIZE_TEMP 복구 ──
+      // ── Phase 0: 서버 폴더 목록 확인 + 메일 분포 파악 ──
       let folders = [];
       try {
         folders = await client.listFolders();
@@ -212,20 +233,20 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
         log('error', `  폴더 목록 조회 실패: ${err.message}`);
       }
 
-      // 이전 버전 임시 폴더(CATEGORIZE_TEMP)가 있고 INBOX.분류임시가 없으면 RENAME으로 복구
-      const hasOldTemp  = folders.some(f => f === OLD_TEMP || f.endsWith('/' + OLD_TEMP));
-      const hasNewTemp  = folders.some(f => f === TEMP_FOLDER || f.includes('분류임시'));
+      const hasOldTemp = folders.some(f => f === OLD_TEMP || f.endsWith('/' + OLD_TEMP));
+      let hasNewTemp   = folders.some(f => f === TEMP_FOLDER || f.includes('분류임시'));
+
+      // CATEGORIZE_TEMP → INBOX.분류임시 RENAME으로 복구
       if (hasOldTemp && !hasNewTemp) {
         log('info', `🔄 ${OLD_TEMP} → ${TEMP_FOLDER} 복구 중...`);
         try {
           await client.renameMailbox(OLD_TEMP, TEMP_FOLDER);
-          log('info', `  ✅ 복구 완료 — 이전 임시 폴더 이름 변경 성공`);
-          try { await client.reconnect(); } catch (_) {}
+          log('info', `  ✅ 복구 완료`);
+          hasNewTemp = true;
+          await safeReconnect();
         } catch (err) {
-          log('error', `  ⚠️ RENAME 실패: ${err.message} — Phase 1에서 INBOX 재확인`);
+          log('error', `  ⚠️ RENAME 실패: ${err.message}`);
         }
-      } else if (hasOldTemp && hasNewTemp) {
-        log('info', `  양쪽 임시 폴더 모두 존재: ${OLD_TEMP}, ${TEMP_FOLDER}`);
       }
 
       // ── Phase 1: INBOX → INBOX.분류임시 ──
@@ -236,45 +257,68 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
           log('info', `  📦 ${n.toLocaleString()}개 임시 이동 완료`)
         );
         log('info', `  총 ${drained.toLocaleString()}개 임시 폴더로 이동`);
+        if (drained > 0) hasNewTemp = true;
       } catch (err) {
         log('error', `❌ INBOX 이동 실패: ${err.message}`);
       }
 
-      // Phase 1 후 반드시 재연결: INBOX SELECT 상태에서 TEMP 폴더 전환 시 Nate BYE 방지
-      try { await client.reconnect(); } catch (_) {}
-
-      // TEMP 메일 수 확인 (진단용 로그)
-      let tempCount = 0;
-      try {
-        tempCount = await client.getMailboxExists(TEMP_FOLDER);
-        log('info', `  임시 폴더 메일 수: ${tempCount.toLocaleString()}개`);
-      } catch (err) {
-        const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
-        log('error', `  임시 폴더 확인 실패: ${err.message}${detail}`);
-        // tempCount=0이어도 Phase 2 진행 (TEMP에 메일이 있을 수 있음)
+      // Phase 1 후 재연결 (INBOX SELECT → TEMP SELECT 전환 시 Nate BYE 방지)
+      const reconnOk = await safeReconnect();
+      if (!reconnOk) {
+        log('error', '❌ 재연결 실패 — 분류를 중단합니다.');
+        return;
       }
-      tempHasEmails = true; // 항상 Phase 2·복원 시도 (TEMP 비어있으면 FETCH가 0 반환하고 즉시 종료)
 
-      // ── Phase 2: CATEGORIZE_TEMP FETCH → matchFn → MOVE ──
-      log('info', '📂 Phase 2: 임시 폴더에서 카테고리 분류 중 (FETCH 방식)...');
+      // TEMP 폴더가 없으면 Phase 2 건너뜀
+      if (!hasNewTemp) {
+        // 각 폴더 메일 수 파악 (어디에 메일이 있는지 확인)
+        log('info', '📊 폴더별 메일 수 확인 중...');
+        const skipFolders = new Set(['Sent Messages', 'Drafts', 'Deleted Messages', '내게쓴메일함', '정크 메일', '광고함']);
+        for (const folder of folders) {
+          if (skipFolders.has(folder)) continue;
+          try {
+            const cnt = await client.getMailboxExists(folder);
+            if (cnt > 0) log('info', `  📁 ${folder}: ${cnt.toLocaleString()}개`);
+            await safeReconnect();
+          } catch (_) {}
+        }
+        log('info', '⚠️ 임시 폴더 없음 — INBOX도 비어있음. 분류할 메일이 없습니다.');
+        tempHasEmails = false;
+      } else {
+        tempHasEmails = true;
+      }
+
+      if (!tempHasEmails) return;
+
+      // TEMP 메일 수 확인 (진단용)
+      try {
+        const tempCount = await client.getMailboxExists(TEMP_FOLDER);
+        log('info', `  임시 폴더 메일 수: ${tempCount.toLocaleString()}개`);
+        await safeReconnect();
+      } catch (err) {
+        log('error', `  임시 폴더 확인 실패: ${err.message}`);
+        await safeReconnect();
+      }
+
+      // ── Phase 2: TEMP FETCH → matchFn → MOVE ──
+      log('info', '📂 Phase 2: 임시 폴더에서 카테고리 분류 중...');
       const MAX_PASSES = 60;
       let consecutiveLockFails = 0;
 
       for (let pass = 0; pass < MAX_PASSES; pass++) {
         let fetchResult;
         try {
-          if (!client.usable) await client.reconnect();
+          if (!client.usable) await safeReconnect();
           fetchResult = await client.fetchFolderClassified(TEMP_FOLDER, matchFn, (n) => {
             if (n % 1000 === 0) log('info', `  📧 ${n.toLocaleString()}개 조회 중...`);
           });
           consecutiveLockFails = 0;
         } catch (err) {
-          // getMailboxLock 실패: 폴더 없음 또는 연결 불가
           const detail = err.responseText ? ` [${err.responseText.trim()}]` : '';
           log('error', `❌ FETCH 잠금 실패 (${pass + 1}회): ${err.message}${detail}`);
           consecutiveLockFails++;
-          if (consecutiveLockFails >= 3) break; // 3회 연속 잠금 실패 → TEMP 없음
-          try { await client.reconnect(); } catch (_) {}
+          if (consecutiveLockFails >= 3) break;
+          await safeReconnect();
           continue;
         }
         if (fetchResult.error) log('error', `⚠️ FETCH 중단: ${fetchResult.error.message}`);
@@ -285,7 +329,7 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
 
         if (catCount > 0) {
           try {
-            if (!client.usable) await client.reconnect();
+            if (!client.usable) await safeReconnect();
             const moveResult = await client.moveCategorizedFromFolder(TEMP_FOLDER, buckets);
             for (const [folderName, count] of Object.entries(moveResult.catMoved)) {
               const cat  = CATEGORIES.find(c => c.name === folderName);
@@ -295,27 +339,25 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
             }
           } catch (moveErr) {
             log('error', `  ⚠️ MOVE 실패: ${moveErr.message}`);
-            try { await client.reconnect(); } catch (_) {}
+            await safeReconnect();
             continue;
           }
         }
 
-        if (catCount === 0 && !fetchErr) break; // FETCH 완료 + 분류 대상 없음 → 완료
-        if (fetchErr) {
-          try { await client.reconnect(); } catch (_) {}
-        }
+        if (catCount === 0 && !fetchErr) break;
+        if (fetchErr) await safeReconnect();
       }
     } finally {
-      // 미분류 메일 INBOX 복원 (TEMP 없거나 비어있으면 복원도 0건 → 정상)
+      if (!tempHasEmails) return; // TEMP 없었으면 복원 불필요
       log('info', '\n📬 임시 보관 메일 받은편지함으로 복원 중...');
       try {
-        if (!client.usable) await client.reconnect();
+        if (!client.usable) await safeReconnect();
         let restored;
         try {
           restored = await client.searchAndMoveAll(TEMP_FOLDER, 'INBOX', 200);
         } catch (err) {
           log('error', `  복원 1차 실패: ${err.message}`);
-          await client.reconnect();
+          await safeReconnect();
           restored = await client.searchAndMoveAll(TEMP_FOLDER, 'INBOX', 200);
         }
         if (restored > 0) {
@@ -327,7 +369,7 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
         }
       } catch (err) {
         log('error', `  ⚠️ 복원 실패: ${err.message}`);
-        log('error', `  임시 폴더 '${TEMP_FOLDER}'에 메일이 남아있습니다. 수동으로 받은편지함으로 이동해주세요.`);
+        log('error', `  '${TEMP_FOLDER}' 폴더에 메일이 남아있을 수 있습니다. Nate 웹메일에서 확인해주세요.`);
         logger.error('CATEGORIZE', `[${provider}] 복원 실패: ${err.message}`);
       }
     }
