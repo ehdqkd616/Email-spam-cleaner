@@ -249,6 +249,9 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
         }
       }
 
+      // Phase 0(listFolders/RENAME) 후 재연결: Nate가 첫 연결에서 INBOX EXISTS=0(stale) 반환하는 현상 방지
+      await safeReconnect();
+
       // ── Phase 1: INBOX → INBOX.분류임시 ──
       log('info', '📂 Phase 1: 받은편지함 → 임시 폴더 이동 중...');
       let drained = 0;

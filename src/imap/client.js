@@ -291,6 +291,7 @@ class ImapClient {
     let totalMoved      = 0;
     let tempCreated     = false;
     let consecutiveFails = 0;
+    let staleRetried    = false; // Nate stale EXISTS=0 재시도 플래그 (최대 1회)
     const MAX_PASSES    = 300;
     const MAX_FAILS     = 10;
 
@@ -303,8 +304,7 @@ class ImapClient {
         let before = 0;
         try {
           before = this.imap.mailbox.exists;
-          if (before === 0) { lock.release(); break; }
-
+          // EXISTS=0이더라도 Nate는 stale값을 반환할 수 있음 → 항상 MOVE 시도 후 uidMap으로 판단
           try {
             moveResult = await this.imap.messageMove('1:*', tempFolder);
           } catch (err) {
@@ -319,7 +319,22 @@ class ImapClient {
           // moveResult === false: resolveRange가 false 반환 (mailbox가 비어있음을 이미 알고있음)
           // moveResult.uidMap.size === 0: UIDPLUS MOVE에서 아무것도 이동 안됨 → INBOX 비어있음
           const movedCount = moveResult === false ? 0 : (moveResult?.uidMap?.size ?? null);
-          if (movedCount === 0) { lock.release(); break; }
+          if (movedCount === 0) {
+            lock.release();
+            // Nate stale EXISTS 감지: STATUS로 실제 메일 수 확인 후 1회 재연결
+            if (!staleRetried) {
+              staleRetried = true;
+              try {
+                const st = await this.imap.status('INBOX', { messages: true });
+                if ((st.messages ?? 0) > 0) {
+                  await this.reconnect();
+                  pass--; // for 루프 pass++ 후 동일 pass 재실행
+                  continue;
+                }
+              } catch (_) {}
+            }
+            break;
+          }
 
           totalMoved += movedCount ?? before; // UIDPLUS: 정확한 수, 아니면 SELECT 시점의 수
           if (onProgress) onProgress(totalMoved);
