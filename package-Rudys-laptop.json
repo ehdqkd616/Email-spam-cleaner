@@ -1,0 +1,29 @@
+{
+  "name": "gmail-spam-cleaner",
+  "version": "1.0.0",
+  "description": "Gmail 광고·스팸 메일 자동 정리 도구",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dry-run": "node src/index.js --dry-run",
+    "server": "node server.js",
+    "client": "npm run dev --prefix client",
+    "dev": "concurrently \"npm run server\" \"npm run client\""
+  },
+  "dependencies": {
+    "@azure/msal-node": "^5.2.2",
+    "chalk": "^4.1.2",
+    "cli-table3": "^0.6.5",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "express-session": "^1.19.0",
+    "googleapis": "^144.0.0",
+    "imapflow": "^1.0.169",
+    "inquirer": "^8.2.6",
+    "ora": "^5.4.1"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.3"
+  }
+}
