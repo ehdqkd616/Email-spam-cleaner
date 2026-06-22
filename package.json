@@ -2,13 +2,41 @@
   "name": "gmail-spam-cleaner",
   "version": "1.0.0",
   "description": "Gmail 광고·스팸 메일 자동 정리 도구",
-  "main": "src/index.js",
+  "main": "electron/main.js",
   "scripts": {
     "start": "node src/index.js",
     "dry-run": "node src/index.js --dry-run",
     "server": "node server.js",
     "client": "npm run dev --prefix client",
-    "dev": "concurrently \"npm run server\" \"npm run client\""
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "app": "node electron/launch.js",
+    "app:build": "electron-builder --win --x64"
+  },
+  "build": {
+    "appId": "com.rudy.mailspamcleaner",
+    "productName": "메일 스팸 정리기",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "electron/**",
+      "src/**",
+      "server.js",
+      "package.json",
+      "!client/node_modules",
+      "!dist-electron"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "electron/icon.ico",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
   },
   "dependencies": {
     "@azure/msal-node": "^5.2.2",
@@ -24,6 +52,8 @@
     "ora": "^5.4.1"
   },
   "devDependencies": {
-    "concurrently": "^10.0.3"
+    "concurrently": "^10.0.3",
+    "electron": "^35.7.5",
+    "electron-builder": "^25.1.8"
   }
 }

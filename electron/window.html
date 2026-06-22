@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'">
+  <title>메일 스팸 정리기</title>
+  <style>
+    :root {
+      --bg:      #0f0f1a;
+      --surface: #1a1a2e;
+      --border:  #2a2a45;
+      --green:   #22c55e;
+      --red:     #f87171;
+      --yellow:  #fbbf24;
+      --accent:  #6366f1;
+      --text:    #e2e8f0;
+      --muted:   #64748b;
+      --font-mono: 'Cascadia Code', 'Consolas', 'D2Coding', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 13px;
+      overflow: hidden;
+      user-select: none;
+    }
+
+    body { display: flex; flex-direction: column; }
+
+    /* ── 헤더 ── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .status-dot {
+      width: 9px; height: 9px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex-shrink: 0;
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+    .status-dot.running {
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+    }
+
+    .app-name { font-weight: 600; font-size: 14px; color: var(--text); }
+
+    .status-text { font-size: 12px; color: var(--muted); }
+    .status-text.running { color: var(--green); }
+
+    .spacer { flex: 1; }
+
+    /* ── 버튼 ── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 5px 12px;
+      border-radius: 5px;
+      border: 1px solid var(--border);
+      background: #242438;
+      color: var(--text);
+      font-size: 12px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+      white-space: nowrap;
+    }
+    .btn:hover:not(:disabled)  { background: #2e2e50; border-color: var(--accent); }
+    .btn:disabled              { opacity: 0.35; cursor: not-allowed; }
+    .btn.primary               { background: var(--accent); border-color: var(--accent); }
+    .btn.primary:hover:not(:disabled) { background: #7577f5; }
+    .btn.danger                { border-color: #7f1d1d; }
+    .btn.danger:hover:not(:disabled)  { background: #450a0a; border-color: var(--red); }
+
+    /* ── 컨트롤 바 ── */
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .divider { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+
+    /* ── 로그 필터 바 ── */
+    .log-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 16px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .filter-chip {
+      padding: 2px 8px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .filter-chip:hover            { color: var(--text); border-color: #4a4a70; }
+    .filter-chip.active           { color: var(--text); background: #2a2a48; border-color: var(--accent); }
+    .filter-chip.error.active     { color: var(--red);    border-color: var(--red); }
+    .filter-chip.success.active   { color: var(--green);  border-color: var(--green); }
+
+    #btn-autoscroll {
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 2px 8px;
+      border-radius: 12px;
+      border: 1px solid transparent;
+      background: transparent;
+      font-family: inherit;
+      transition: all 0.15s;
+    }
+    #btn-autoscroll.active { color: var(--accent); border-color: var(--accent); }
+    #btn-autoscroll:hover  { border-color: #4a4a70; }
+
+    #log-count { margin-left: 6px; color: var(--muted); font-size: 11px; }
+
+    /* ── 로그 영역 ── */
+    .log-area {
+      flex: 1;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 4px 0 8px;
+    }
+
+    .log-entry {
+      display: flex;
+      align-items: baseline;
+      gap: 0;
+      padding: 1.5px 16px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .log-entry:hover { background: rgba(255,255,255,0.03); }
+
+    .le-ts   { color: var(--muted); flex-shrink: 0; min-width: 68px; }
+    .le-cat  { color: #7c85a8; flex-shrink: 0; min-width: 90px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; padding-right: 8px; }
+    .le-msg  { color: var(--text); word-break: break-word; white-space: pre-wrap; flex: 1; }
+
+    .log-entry.error   .le-msg { color: var(--red); }
+    .log-entry.success .le-msg { color: var(--green); }
+    .log-entry.warn    .le-msg { color: var(--yellow); }
+
+    .log-entry.sys .le-cat { color: #94a3b8; }
+    .log-entry.sys .le-msg { color: #94a3b8; font-style: italic; }
+
+    /* ── 상태바 ── */
+    .statusbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 4px 16px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--muted);
+      flex-shrink: 0;
+      background: var(--surface);
+    }
+
+    /* ── 스크롤바 ── */
+    ::-webkit-scrollbar       { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2a2a45; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+    /* ── 빈 상태 ── */
+    .empty-hint {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--muted);
+      gap: 8px;
+      font-size: 13px;
+    }
+    .empty-hint .icon { font-size: 32px; }
+  </style>
+</head>
+<body>
+
+<!-- 헤더 -->
+<div class="header">
+  <div class="status-dot" id="dot"></div>
+  <span class="app-name">메일 스팸 정리기</span>
+  <span class="status-text" id="status-text">서버 시작 중...</span>
+  <div class="spacer"></div>
+  <button class="btn primary" id="btn-open" disabled>웹앱 열기 ↗</button>
+</div>
+
+<!-- 컨트롤 -->
+<div class="controls">
+  <button class="btn" id="btn-start" disabled>▶ 시작</button>
+  <button class="btn danger" id="btn-stop" disabled>■ 중지</button>
+  <button class="btn" id="btn-restart" disabled>↺ 재시작</button>
+  <div class="divider"></div>
+  <button class="btn" id="btn-logs">📁 로그 폴더</button>
+  <button class="btn" id="btn-clear">✕ 지우기</button>
+</div>
+
+<!-- 로그 필터 바 -->
+<div class="log-bar">
+  <span>로그</span>
+  <button class="filter-chip active" data-f="all">전체</button>
+  <button class="filter-chip error"   data-f="error">오류</button>
+  <button class="filter-chip success" data-f="success">성공</button>
+  <button id="btn-autoscroll" class="active">↓ 자동스크롤</button>
+  <span id="log-count"></span>
+</div>
+
+<!-- 로그 뷰 -->
+<div class="log-area" id="log-area">
+  <div class="empty-hint" id="empty-hint">
+    <span class="icon">📋</span>
+    <span>오늘의 로그가 여기에 표시됩니다</span>
+  </div>
+</div>
+
+<!-- 상태바 -->
+<div class="statusbar">
+  <span id="sb-port">포트: 3005</span>
+  <span id="sb-entries">항목: 0개</span>
+</div>
+
+<script>
+  const { startServer, stopServer, restartServer, openApp, openLogsFolder,
+          onStatus, onInitialLogs, onLogEntry, onServerOut } = window.api;
+
+  // ── 상태 ──────────────────────────────────────────────────────────
+  let entries    = [];   // 전체 로그 항목
+  let filter     = 'all';
+  let autoScroll = true;
+  let rendered   = 0;   // 현재 DOM에 렌더된 항목 수
+
+  // ── DOM 참조 ──────────────────────────────────────────────────────
+  const dot        = document.getElementById('dot');
+  const statusText = document.getElementById('status-text');
+  const btnOpen    = document.getElementById('btn-open');
+  const btnStart   = document.getElementById('btn-start');
+  const btnStop    = document.getElementById('btn-stop');
+  const btnRestart = document.getElementById('btn-restart');
+  const logArea    = document.getElementById('log-area');
+  const emptyHint  = document.getElementById('empty-hint');
+  const sbEntries  = document.getElementById('sb-entries');
+  const logCount   = document.getElementById('log-count');
+  const asBtn      = document.getElementById('btn-autoscroll');
+
+  // ── 서버 상태 업데이트 ──────────────────────────────────────────────
+  function setStatus(running) {
+    dot.className        = 'status-dot' + (running ? ' running' : '');
+    statusText.textContent = running ? '실행 중 (포트 3005)' : '서버 중지됨';
+    statusText.className   = 'status-text' + (running ? ' running' : '');
+    btnOpen.disabled    = !running;
+    btnStart.disabled   =  running;
+    btnStop.disabled    = !running;
+    btnRestart.disabled = !running;
+  }
+
+  // ── 로그 렌더링 ──────────────────────────────────────────────────────
+  function escape(s) {
+    return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function levelClass(level) {
+    const l = (level ?? '').toLowerCase();
+    if (l === 'error')   return 'error';
+    if (l === 'success') return 'success';
+    if (l === 'warn' || l === 'warning') return 'warn';
+    return '';
+  }
+
+  function makeEl(entry) {
+    const cls  = levelClass(entry.level);
+    const show = filter === 'all'
+      || (filter === 'error'   && cls === 'error')
+      || (filter === 'success' && cls === 'success');
+    if (!show) return null;
+
+    const ts  = (entry.ts ?? '').split(' ')[1] ?? '';
+    const cat = escape(entry.category ?? '');
+    const msg = escape(entry.message ?? entry.msg ?? '');
+
+    const el = document.createElement('div');
+    el.className = 'log-entry' + (cls ? ' ' + cls : '');
+    el.innerHTML = `<span class="le-ts">${ts}</span><span class="le-cat">${cat}</span><span class="le-msg">${msg}</span>`;
+    return el;
+  }
+
+  function makeSysEl(text) {
+    const el = document.createElement('div');
+    el.className = 'log-entry sys';
+    el.innerHTML = `<span class="le-ts"></span><span class="le-cat">SERVER</span><span class="le-msg">${escape(text)}</span>`;
+    return el;
+  }
+
+  function appendEl(el) {
+    if (!el) return;
+    if (emptyHint.parentElement) emptyHint.remove();
+    logArea.appendChild(el);
+    if (autoScroll) logArea.scrollTop = logArea.scrollHeight;
+  }
+
+  function rebuildDOM() {
+    logArea.innerHTML = '';
+    rendered = 0;
+    const frag = document.createDocumentFragment();
+    let count = 0;
+    for (const e of entries) {
+      const el = makeEl(e);
+      if (el) { frag.appendChild(el); count++; }
+    }
+    if (count === 0) {
+      logArea.appendChild(emptyHint);
+    } else {
+      logArea.appendChild(frag);
+    }
+    rendered = entries.length;
+    updateCount();
+    if (autoScroll) logArea.scrollTop = logArea.scrollHeight;
+  }
+
+  function updateCount() {
+    const visible = logArea.querySelectorAll('.log-entry:not(.sys)').length;
+    sbEntries.textContent = `항목: ${entries.length}개`;
+    logCount.textContent  = entries.length !== visible ? `(표시: ${visible})` : '';
+  }
+
+  // ── IPC 이벤트 ─────────────────────────────────────────────────────
+  onStatus(running => setStatus(running));
+
+  onInitialLogs(list => {
+    entries = list;
+    rebuildDOM();
+  });
+
+  onLogEntry(entry => {
+    entries.push(entry);
+    appendEl(makeEl(entry));
+    updateCount();
+  });
+
+  onServerOut(text => {
+    text.split('\n').forEach(line => {
+      if (line.trim()) appendEl(makeSysEl(line));
+    });
+  });
+
+  // ── 버튼 이벤트 ────────────────────────────────────────────────────
+  btnStart.addEventListener('click',   startServer);
+  btnStop.addEventListener('click',    stopServer);
+  btnRestart.addEventListener('click', restartServer);
+  btnOpen.addEventListener('click',    openApp);
+
+  document.getElementById('btn-logs').addEventListener('click', openLogsFolder);
+
+  document.getElementById('btn-clear').addEventListener('click', () => {
+    entries = [];
+    logArea.innerHTML = '';
+    logArea.appendChild(emptyHint);
+    updateCount();
+  });
+
+  // ── 필터 버튼 ──────────────────────────────────────────────────────
+  document.querySelectorAll('.filter-chip').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filter-chip').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      filter = btn.dataset.f;
+      rebuildDOM();
+    });
+  });
+
+  // ── 자동 스크롤 ────────────────────────────────────────────────────
+  asBtn.addEventListener('click', () => {
+    autoScroll = !autoScroll;
+    asBtn.classList.toggle('active', autoScroll);
+    if (autoScroll) logArea.scrollTop = logArea.scrollHeight;
+  });
+
+  logArea.addEventListener('scroll', () => {
+    const el = logArea;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (!atBottom && autoScroll) {
+      autoScroll = false;
+      asBtn.classList.remove('active');
+    } else if (atBottom && !autoScroll) {
+      autoScroll = true;
+      asBtn.classList.add('active');
+    }
+  });
+</script>
+</body>
+</html>
