@@ -23,7 +23,7 @@ Write-Host ""
 # ── 루트 패키지 설치 ──────────────────────────────────────────────
 $rootModules = Join-Path $ProjectDir "node_modules"
 if (-not (Test-Path $rootModules)) {
-    Write-Host " [1/3] 패키지 설치 중... (시간이 걸릴 수 있습니다)" -ForegroundColor Yellow
+    Write-Host " [1/4] 패키지 설치 중... (시간이 걸릴 수 있습니다)" -ForegroundColor Yellow
     Push-Location $ProjectDir
     & npm install
     Pop-Location
@@ -40,7 +40,7 @@ Write-Host ""
 # ── 클라이언트 패키지 설치 ────────────────────────────────────────
 $clientModules = Join-Path $ProjectDir "client\node_modules"
 if (-not (Test-Path $clientModules)) {
-    Write-Host " [2/3] 클라이언트 패키지 설치 중..." -ForegroundColor Yellow
+    Write-Host " [2/4] 클라이언트 패키지 설치 중..." -ForegroundColor Yellow
     Push-Location (Join-Path $ProjectDir "client")
     & npm install
     Pop-Location
@@ -54,8 +54,20 @@ if (-not (Test-Path $clientModules)) {
 }
 Write-Host ""
 
+# ── React 클라이언트 빌드 ─────────────────────────────────────────
+Write-Host " [3/4] 웹 UI 빌드 중..." -ForegroundColor Yellow
+Push-Location (Join-Path $ProjectDir "client")
+& npm run build
+Pop-Location
+if ($LASTEXITCODE -ne 0) {
+    Write-Host " [오류] 클라이언트 빌드 실패" -ForegroundColor Red
+    exit 1
+}
+Write-Host " [OK] 웹 UI 빌드 완료" -ForegroundColor Green
+Write-Host ""
+
 # ── 아이콘 + 바탕화면 바로가기 생성 ──────────────────────────────
-Write-Host " [3/3] 바탕화면 아이콘 생성 중..." -ForegroundColor Yellow
+Write-Host " [4/4] 바탕화면 아이콘 생성 중..." -ForegroundColor Yellow
 & (Join-Path $ProjectDir "setup-shortcut.ps1")
 if ($LASTEXITCODE -ne 0) {
     Write-Host " [오류] 바로가기 생성 실패" -ForegroundColor Red

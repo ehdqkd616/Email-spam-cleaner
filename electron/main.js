@@ -55,7 +55,7 @@ function startServer() {
   serverProcess = spawn('node', ['server.js'], {
     cwd:         ROOT,
     stdio:       ['ignore', 'pipe', 'pipe'],
-    env:         { ...process.env },
+    env:         { ...process.env, NODE_ENV: 'production' },
     windowsHide: true,
   });
   serverProcess.stdout.on('data', d => win?.webContents.send('server-out', d.toString().trimEnd()));

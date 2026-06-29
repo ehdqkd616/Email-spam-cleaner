@@ -39,7 +39,7 @@ app.use('/api/logs', logsRouter);
 // ── 프로덕션: React 빌드 서빙 ──────────────────────────────────────
 if (IS_PROD) {
   app.use(express.static(path.join(__dirname, 'client', 'dist')));
-  app.get('*', (_, res) =>
+  app.use((_, res) =>
     res.sendFile(path.join(__dirname, 'client', 'dist', 'index.html'))
   );
 }
