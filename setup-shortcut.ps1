@@ -30,7 +30,7 @@ $VbsPath  = Join-Path $ProjectDir "run-app.vbs"
 $LaunchJs = Join-Path $ProjectDir "electron\launch.js"
 $vbsContent = 'Set WshShell = CreateObject("WScript.Shell")' + "`r`n" +
               "WshShell.CurrentDirectory = " + '"' + $ProjectDir + '"' + "`r`n" +
-              'WshShell.Run "node """ & "' + $LaunchJs + '" & """, 0, False'
+              'WshShell.Run "node " & Chr(34) & "' + $LaunchJs + '" & Chr(34), 0, False'
 [System.IO.File]::WriteAllText($VbsPath, $vbsContent, [System.Text.Encoding]::ASCII)
 Write-Host "  [OK] run-app.vbs 생성 완료" -ForegroundColor Green
 
