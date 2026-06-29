@@ -1,6 +1,32 @@
+# 의존성
 node_modules/
+
+# 환경변수 및 인증 자격증명
 .env
+.env.*
+!.env.example
 credentials.json
 token.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 로그 및 실행 데이터
 *.log
 logs/
+
+# 빌드 산출물
+dist-electron/
+
+# 기기별 로컬 설정 파일 (기기명 포함)
+*-Rudys-laptop.*
+
+# OS 메타데이터
+.DS_Store
+Thumbs.db
+
+# 개인 문서 (로컬 전용)
+지침서.txt
+이메일_광고스팸_정리_가이드.docx
+이메일_광고스팸_정리_가이드.md
