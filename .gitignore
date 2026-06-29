@@ -19,6 +19,9 @@ logs/
 # 빌드 산출물
 dist-electron/
 
+# setup.bat 이 자동 생성하는 파일 (환경별 경로 하드코딩)
+run-app.vbs
+
 # 기기별 로컬 설정 파일 (기기명 포함)
 *-Rudys-laptop.*
 

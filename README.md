@@ -65,7 +65,17 @@ Email-spam-cleaner/
 - Node.js 18 이상
 - Gmail 사용 시: Google Cloud Console에서 OAuth2 자격증명 발급
 
-### 설치
+### 새 환경에서 빠른 시작 (Windows)
+
+`setup.bat`을 더블클릭하면 아래 과정이 자동으로 진행됩니다.
+
+1. Node.js 설치 여부 확인
+2. `npm install` (루트 + client 디렉토리)
+3. 바탕화면에 **"Mail Spam Cleaner"** 실행 아이콘 생성
+
+이후 바탕화면 아이콘을 더블클릭하면 Electron 앱이 실행됩니다.
+
+### 수동 설치
 
 ```bash
 npm install
