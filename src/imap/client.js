@@ -99,33 +99,90 @@ class ImapClient {
 
   // 폴더 내 전체 메시지를 대상 폴더로 이동 — Nate 등 1000개 슬라이딩 윈도우 서버 대응
   // 패스마다 락을 재취득: UID SEARCH ALL로 현재 창의 UID를 얻고 이동, 빈 폴더가 될 때까지 반복
-  async searchAndMoveAll(sourceFolder, targetFolder, chunkSize = 50) {
-    let totalMoved = 0;
+  async searchAndMoveAll(sourceFolder, targetFolder, chunkSize = 50, onProgress) {
+    let totalMoved    = 0;
+    let targetCreated = false;
+    let failStreak    = 0;
+
     for (let pass = 0; pass < 500; pass++) {
+      // 연결이 죽어있으면 재연결
+      if (!this.usable) {
+        try { await this.reconnect(); }
+        catch (_) { break; }
+      }
+
+      // ── lock 획득 ──
       let lock;
-      try { lock = await this.imap.getMailboxLock(sourceFolder); }
-      catch (_) { break; } // 폴더 없음(정상 종료) 또는 연결 끊김
-
-      let movedInPass = 0;
       try {
-        const uids = await this.imap.search({ all: true }, { uid: true });
-        for (let i = 0; i < uids.length; i += chunkSize) {
-          const chunk = uids.slice(i, i + chunkSize);
-          try {
-            await this.imap.messageMove(chunk, targetFolder, { uid: true });
-          } catch (moveErr) {
-            const m = `${moveErr.message || ''} ${moveErr.responseText || ''}`.toLowerCase();
-            if (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such')) {
-              await this.imap.mailboxCreate(targetFolder);
-              await this.imap.messageMove(chunk, targetFolder, { uid: true });
-            } else throw moveErr;
-          }
-          movedInPass += chunk.length;
+        lock = await this.imap.getMailboxLock(sourceFolder);
+      } catch (_) {
+        if (!this.usable) {
+          try { await this.reconnect(); } catch (_2) { break; }
+          failStreak++;
+          if (failStreak > 5) break;
+          pass--; continue; // 같은 패스 재시도
         }
-        totalMoved += movedInPass;
-      } finally { lock.release(); }
+        break; // 폴더 없음 등 → 정상 종료
+      }
 
-      if (movedInPass === 0) break; // 폴더 비어있음 → 완료
+      // ── SEARCH ──
+      let uids = [];
+      try {
+        uids = await this.imap.search({ all: true }, { uid: true });
+      } catch (_) {
+        try { lock.release(); } catch (_2) {}
+        if (!this.usable) {
+          try { await this.reconnect(); } catch (_2) { break; }
+          failStreak++;
+          if (failStreak > 5) break;
+          pass--; continue;
+        }
+        break;
+      }
+
+      if (!uids.length) {
+        try { lock.release(); } catch (_) {}
+        break; // 폴더 비어있음 → 완료
+      }
+
+      // ── MOVE (chunk 단위) ──
+      let connLost = false;
+      let movedInPass = 0;
+      for (let i = 0; i < uids.length; i += chunkSize) {
+        if (!this.usable) { connLost = true; break; }
+        const chunk = uids.slice(i, i + chunkSize);
+        try {
+          await this.imap.messageMove(chunk, targetFolder, { uid: true });
+        } catch (moveErr) {
+          if (!this.usable) { connLost = true; break; }
+          const m = `${moveErr.message || ''} ${moveErr.responseText || ''}`.toLowerCase();
+          if (!targetCreated && (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such'))) {
+            try {
+              await this.imap.mailboxCreate(targetFolder);
+              try { await this.imap.mailboxSubscribe(targetFolder); } catch (_2) {}
+              targetCreated = true;
+              await this.imap.messageMove(chunk, targetFolder, { uid: true });
+            } catch (_) { connLost = !this.usable; break; }
+          } else {
+            break; // 알 수 없는 에러 → 이 패스 중단, 다음 패스에서 재시도
+          }
+        }
+        movedInPass += chunk.length;
+        totalMoved  += chunk.length;
+        if (onProgress) onProgress(totalMoved);
+      }
+
+      try { lock.release(); } catch (_) {}
+
+      if (connLost) {
+        try { await this.reconnect(); } catch (_) { break; }
+        failStreak++;
+        if (failStreak > 5) break;
+        pass--; continue; // 같은 패스 재시도 (이미 이동된 건 서버에 반영됨)
+      }
+
+      failStreak = 0;
+      if (movedInPass === 0) break; // 이번 패스에서 아무것도 못 이동 → 완료
     }
     return totalMoved;
   }
@@ -309,7 +366,13 @@ class ImapClient {
             moveResult = await this.imap.messageMove('1:*', tempFolder);
           } catch (err) {
             const m = (err.message || '').toLowerCase();
-            if (!tempCreated && (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such'))) {
+            const r = (err.responseText || '').toLowerCase();
+            process.stderr.write(`[drainInboxToTemp] MOVE error: ${err.message} | response: ${err.responseText || ''}\n`);
+            if (!tempCreated && (m.includes('trycreate') || r.includes('trycreate') ||
+                m.includes('nonexist') || r.includes('nonexist') ||
+                m.includes('no such')  || r.includes('no such')  ||
+                m.includes('invalid')  || r.includes('invalid'))) {
+              process.stderr.write(`[drainInboxToTemp] Creating folder: ${tempFolder}\n`);
               await this.imap.mailboxCreate(tempFolder);
               tempCreated = true;
               moveResult = await this.imap.messageMove('1:*', tempFolder);
@@ -355,6 +418,7 @@ class ImapClient {
 
         await new Promise(r => setTimeout(r, 300));
       } catch (err) {
+        process.stderr.write(`[drainInboxToTemp] pass=${pass} outer error: ${err.message}\n`);
         consecutiveFails++;
         if (consecutiveFails > MAX_FAILS) break;
         await new Promise(r => setTimeout(r, 1000));

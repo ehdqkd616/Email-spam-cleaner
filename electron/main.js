@@ -42,11 +42,15 @@ const ICO_FILE    = path.join(__dirname, 'icon.ico');
 // ── 서버 관리 ────────────────────────────────────────────────────────
 function running() { return serverProcess !== null && !serverProcess.killed; }
 
+function sendToWin(channel, ...args) {
+  if (win && !win.isDestroyed()) win.webContents.send(channel, ...args);
+}
+
 function syncStatus() {
   const r = running();
-  win?.webContents.send('status', r);
+  sendToWin('status', r);
   tray?.setImage(r ? ICO_RUNNING : ICO_STOPPED);
-  tray?.setToolTip(`메일 스팸 정리기 — ${r ? '서버 실행 중 (포트 ${APP_PORT})' : '서버 중지됨'}`);
+  tray?.setToolTip(`메일 스팸 정리기 — ${r ? `서버 실행 중 (포트 ${APP_PORT})` : '서버 중지됨'}`);
   buildTrayMenu();
 }
 
@@ -55,11 +59,11 @@ function startServer() {
   serverProcess = spawn('node', ['server.js'], {
     cwd:         ROOT,
     stdio:       ['ignore', 'pipe', 'pipe'],
-    env:         { ...process.env, NODE_ENV: 'production' },
+    env:         { ...process.env, NODE_ENV: 'production', IMAP_DEBUG: '1' },
     windowsHide: true,
   });
-  serverProcess.stdout.on('data', d => win?.webContents.send('server-out', d.toString().trimEnd()));
-  serverProcess.stderr.on('data', d => win?.webContents.send('server-out', d.toString().trimEnd()));
+  serverProcess.stdout.on('data', d => sendToWin('server-out', d.toString().trimEnd()));
+  serverProcess.stderr.on('data', d => sendToWin('server-out', d.toString().trimEnd()));
   serverProcess.on('exit', () => { serverProcess = null; syncStatus(); });
   syncStatus();
 }
