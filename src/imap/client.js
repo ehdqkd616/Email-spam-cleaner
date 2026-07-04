@@ -636,6 +636,8 @@ class ImapClient {
         msg.includes('already created') || msg.includes('exists already');
       if (!isExisting) throw err;
     }
+    // SUBSCRIBE — Nate는 명시적 구독 없이 SELECT를 거부하는 경우가 있음
+    try { await this.imap.mailboxSubscribe(name); } catch (_) {}
   }
 
   async deleteFolder(path) {

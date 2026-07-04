@@ -252,9 +252,19 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
         }
       }
 
-      // searchAndMoveAll이 UID 기반으로 stale EXISTS 우회하므로 Phase 0 재연결 불필요
-      // 단, 연결이 죽어있으면 한 번만 복구 시도
-      if (!client.usable) await safeReconnect().catch(() => {});
+      // SortTemp 명시적 사전 생성 — TRYCREATE 방식은 Nate에서 \Noselect 폴더를 만들어
+      // SELECT가 거부됨. Phase 1 전에 CREATE로 정식 폴더를 만들어두면 TRYCREATE 불필요
+      if (!hasNewTemp) {
+        try {
+          await client.createFolder(TEMP_FOLDER);
+          log('info', `  ✅ 임시 폴더 사전 생성 완료 (${TEMP_FOLDER})`);
+        } catch (err) {
+          log('warn', `  임시 폴더 사전 생성 실패: ${err.message}`);
+        }
+      }
+
+      // Phase 1 전 재연결 — Phase 0 작업(listFolders·rename·create) 후 클린 상태 보장
+      await safeReconnect().catch(() => {});
 
       // ── Phase 1: INBOX → 임시 폴더 ──
       // searchAndMoveAll 사용: UID SEARCH ALL + UID MOVE — ImapFlow stale EXISTS=0 우회
