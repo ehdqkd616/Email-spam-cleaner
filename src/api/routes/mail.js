@@ -305,7 +305,7 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
 
       // ── Phase 2: TEMP FETCH → matchFn → MOVE ──
       log('info', '📂 Phase 2: 임시 폴더에서 카테고리 분류 중...');
-      const MAX_PASSES = 60;
+      const MAX_PASSES = 2000; // 대용량 메일함 대응 (50만 개까지 처리 가능)
       let consecutiveLockFails = 0;
 
       for (let pass = 0; pass < MAX_PASSES; pass++) {
