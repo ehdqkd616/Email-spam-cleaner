@@ -1,4 +1,5 @@
 const { ImapFlow } = require('imapflow');
+const logger = require('../logger');
 
 const DEFAULT_FOLDERS = {
   INBOX: 'INBOX',
@@ -28,6 +29,44 @@ function groupByFolder(encodedIds) {
     groups[folder].push(uid);
   }
   return groups;
+}
+
+// 검색 조건에 비-ASCII(한글 등) 문자열이 있는지 재귀 확인
+// — 일부 IMAP 서버(Nate 등)가 CHARSET UTF-8 SEARCH의 한글 literal을
+//   제대로 처리하지 못해 오류 없이 0건을 반환하는 문제 감지용
+function hasUnicodeValue(value) {
+  if (value == null) return false;
+  if (typeof value === 'string') return /[^\x00-\x7F]/.test(value);
+  if (Array.isArray(value)) return value.some(hasUnicodeValue);
+  if (typeof value === 'object') return Object.values(value).some(hasUnicodeValue);
+  return false;
+}
+
+// searchInFolder의 criteria 객체를 클라이언트에서 직접 평가 (FETCH 기반 대체 경로용)
+function matchesCriteria(criteria, envelope, flags) {
+  return Object.entries(criteria).every(([key, value]) => {
+    switch (key) {
+      case 'or':
+        return value.some((cond) => matchesCriteria(cond, envelope, flags));
+      case 'subject': {
+        const subject = (envelope.subject || '').toLowerCase();
+        return subject.includes(String(value).toLowerCase());
+      }
+      case 'from': {
+        const f = envelope.from?.[0];
+        const fromStr = f ? `${f.name || ''} ${f.address || ''}`.toLowerCase() : '';
+        return fromStr.includes(String(value).toLowerCase());
+      }
+      case 'seen':
+        return (flags || new Set()).has('\\Seen') === value;
+      case 'before':
+        return !!envelope.date && new Date(envelope.date) < value;
+      case 'since':
+        return !!envelope.date && new Date(envelope.date) >= value;
+      default:
+        return true;
+    }
+  });
 }
 
 class ImapClient {
@@ -74,9 +113,43 @@ class ImapClient {
   async reconnect() {
     try { await this.imap.logout(); } catch (_) {}
     try { this.imap.close();        } catch (_) {}
-    await new Promise(r => setTimeout(r, 2000)); // Nate 서버 세션 정리 대기
-    this._createImap();
-    await this.imap.connect();
+    // Nate 서버 세션 정리 대기 — 직후 재연결은 Unexpected close로 거부되는 일이 잦아
+    // 대기 시간을 늘려가며 여러 번 시도한다
+    const delays = [2000, 4000, 6000, 10000, 15000];
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      await new Promise(r => setTimeout(r, delays[attempt]));
+      this._createImap();
+      try {
+        await this.imap.connect();
+        return;
+      } catch (err) {
+        try { this.imap.close(); } catch (_) {}
+        if (attempt === delays.length - 1) throw err;
+        logger.warn('SYSTEM', `[IMAP] 재연결 실패 (${attempt + 1}회): ${err.message} — 재시도`);
+      }
+    }
+  }
+
+  // Nate는 로그인 직후 "연결 성공" 응답을 보내고 나서 비동기로 연결을 끊는 경우가 있어,
+  // connect() 직후 this.usable을 미리 확인해도 레이스 컨디션으로 놓칠 수 있다.
+  // 그래서 사전 확인 대신 "일단 시도 → 실패하면 재연결 후 1회 재시도" 방식을 쓴다.
+  async _withReconnectRetry(fn) {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = `${err.message || ''} ${err.responseText || ''}`.toLowerCase();
+      const looksLikeDeadConnection =
+        !this.usable || msg.includes('connection not available') || msg.includes('unexpected close');
+      if (!looksLikeDeadConnection) throw err;
+      logger.warn('SYSTEM', `[IMAP] 연결 끊김 감지(${err.message}) — 재연결 후 재시도`);
+      await this.reconnect();
+      try {
+        return await fn();
+      } catch (retryErr) {
+        logger.error('SYSTEM', `[IMAP] 재연결 후에도 실패: ${retryErr.message}`);
+        throw retryErr;
+      }
+    }
   }
 
   async listFolders() {
@@ -84,25 +157,263 @@ class ImapClient {
     return list.map((f) => f.path);
   }
 
+  // 폴더 하나를 전부 읽기전용으로 훑는다 (이동/삭제 없음). Nate가 폴더당 1000통만
+  // 노출하므로, 1000통 꽉 찬 경우 보이는 최대 UID 뒤쪽을 이어서 읽어 전체를 확보한다.
+  async scanFolderAllMessages(folder) {
+    const lock = await this.imap.getMailboxLock(folder, { readOnly: true });
+    const items = [];
+    let maxUid = 0;
+    try {
+      for await (const msg of this.imap.fetch('1:*', { envelope: true }, { uid: true })) {
+        if (!msg.envelope || !msg.uid) continue;
+        if (msg.uid > maxUid) maxUid = msg.uid;
+        items.push({
+          uid: msg.uid,
+          messageId: msg.envelope.messageId || '',
+          subject: msg.envelope.subject || '',
+          date: safeIso(msg.envelope.date),
+          from: msg.envelope.from?.[0] ? (msg.envelope.from[0].name || msg.envelope.from[0].address) : '',
+        });
+      }
+      if (items.length >= 1000) {
+        let cursor = maxUid;
+        for (let round = 0; round < 100; round++) {
+          let got = 0;
+          for await (const msg of this.imap.fetch(`${cursor + 1}:*`, { envelope: true }, { uid: true })) {
+            if (!msg.envelope || !msg.uid || msg.uid <= cursor) continue;
+            got++;
+            if (msg.uid > maxUid) maxUid = msg.uid;
+            items.push({
+              uid: msg.uid,
+              messageId: msg.envelope.messageId || '',
+              subject: msg.envelope.subject || '',
+              date: safeIso(msg.envelope.date),
+              from: msg.envelope.from?.[0] ? (msg.envelope.from[0].name || msg.envelope.from[0].address) : '',
+            });
+          }
+          if (!got || maxUid <= cursor) break;
+          cursor = maxUid;
+        }
+      }
+    } finally { lock.release(); }
+    return items;
+  }
+
   async renameMailbox(oldPath, newPath) {
     return this.imap.mailboxRename(oldPath, newPath);
   }
 
+  // 서버 폴더 목록을 세션당 1회만 조회해 캐싱 (resolveFolder에서 반복 호출됨)
+  async _getFolderList() {
+    if (!this._folderListCache) {
+      try { this._folderListCache = await this.listFolders(); }
+      catch (err) {
+        logger.error('SYSTEM', `[IMAP] 폴더 목록 조회 실패: ${err.message}`);
+        this._folderListCache = [];
+      }
+    }
+    return this._folderListCache;
+  }
+
+  // 개념은 같지만 글자가 아예 다른 폴더명 별칭 (예: 스팸 == 정크메일)
+  // 계정/서비스 버전에 따라 실제 폴더명이 다를 수 있어 substring 매칭만으론 부족
+  static FOLDER_ALIASES = {
+    스팸: ['스팸', '정크', 'junk', 'spam'],
+    광고: ['광고', 'ad', 'promo'],
+    휴지통: ['휴지통', 'trash', 'deleted'],
+  };
+
+  // 설정된 폴더명이 실제 계정에 없을 때(같은 서비스라도 계정/버전별로
+  // '스팸' / '스팸메일함' / '스팸함' / '정크 메일' 등 이름이 다른 경우) 유사한 실제 폴더로 대체
+  async resolveFolder(folder) {
+    if (folder === 'INBOX') return folder;
+    const list = await this._getFolderList();
+    if (list.includes(folder)) return folder;
+
+    const core = folder.replace(/(메일함|편지함|함)$/, '') || folder;
+    const aliases = ImapClient.FOLDER_ALIASES[core] || [core];
+    const candidates = list.filter((f) => f !== 'INBOX' &&
+      aliases.some((alias) => f.toLowerCase().includes(alias.toLowerCase())));
+    if (candidates.length) {
+      candidates.sort((a, b) => a.length - b.length);
+      const resolved = candidates[0];
+      logger.warn('SYSTEM', `[IMAP] 폴더 "${folder}"를 찾을 수 없어 "${resolved}"(으)로 대체`);
+      return resolved;
+    }
+    // 대체 후보를 못 찾음 — 실제 서버 폴더 목록을 남겨 원인 파악
+    logger.error('SYSTEM', `[IMAP] 폴더 "${folder}"를 찾을 수 없고 대체 후보도 없음. 서버 실제 폴더 목록: [${list.join(', ')}]`);
+    return folder;
+  }
+
   async searchInFolder(folder, criteria, limit = 5000) {
-    const lock = await this.imap.getMailboxLock(folder, { readOnly: true });
+    const resolved = await this.resolveFolder(folder);
+
+    // 한글 등 비-ASCII 검색어가 섞인 조건은 서버 SEARCH 대신 FETCH+클라이언트 매칭 사용
+    // (일부 IMAP 서버가 CHARSET UTF-8 SEARCH의 한글 literal을 오류 없이 0건으로 반환함)
+    if (hasUnicodeValue(criteria)) {
+      return this._searchByFetch(resolved, criteria, limit);
+    }
+
+    const lock = await this.imap.getMailboxLock(resolved, { readOnly: true });
     try {
       const uids = await this.imap.search(criteria, { uid: true });
       return uids.slice(-limit).reverse()
-        .map((uid) => ({ id: encodeId(folder, uid), uid, folder }));
+        .map((uid) => ({ id: encodeId(resolved, uid), uid, folder: resolved }));
     } finally { lock.release(); }
+  }
+
+  async _searchByFetch(folder, criteria, limit) {
+    const lock = await this.imap.getMailboxLock(folder, { readOnly: true });
+    const matched = [];
+    try {
+      for await (const msg of this.imap.fetch('1:*', { envelope: true, flags: true }, { uid: true })) {
+        if (!msg.envelope || !msg.uid) continue;
+        if (matchesCriteria(criteria, msg.envelope, msg.flags)) {
+          matched.push({ id: encodeId(folder, msg.uid), uid: msg.uid, folder });
+        }
+      }
+    } finally { lock.release(); }
+    return matched.slice(-limit).reverse();
+  }
+
+  // 받은편지함 전체를 matcher.js의 detectAd() 스코어링 엔진으로 판별
+  // (기존 inboxKeywords는 13개 고정 키워드 substring만 확인해 [광고] 표기, 할인율,
+  //  마케팅 발신 도메인 등 실제로 광고를 가장 잘 가려내는 신호를 전혀 못 씀 — 그래서
+  //  "자동 분류"가 광고 제외용으로 이미 쓰고 있는 이 엔진을 스캔에도 그대로 재사용)
+  //
+  // bayesTrainConfig가 주어지면 계정에 이미 분류된 폴더(광고함 vs 결제·영수증 등)로
+  // 학습한 나이브 베이즈 모델을 2차 판별기로 함께 사용 — 단, 규칙 기반이 이미 광고가
+  // 아니라고 확정한(트랜잭션 보호) 메일은 베이즈 결과와 무관하게 항상 안전하게 유지한다.
+  async scanInboxForAds(readFilter, limit = 5000, bayesTrainConfig = null) {
+    const { detectAd, isShielded } = require('../matcher');
+    const bayes = require('../bayes');
+
+    let bayesModel = null;
+    if (bayesTrainConfig) {
+      const providerKey = this.constructor.name.replace(/Client$/, '').toLowerCase();
+      try { bayesModel = await bayes.getOrTrainModel(providerKey, this, bayesTrainConfig); }
+      catch (_) { /* 학습 실패해도 규칙 기반 판정은 계속 동작 */ }
+    }
+
+    // 다른 폴더 스캔은 resolveFolder()가 먼저 LIST를 날려 그 사이에 Nate의
+    // "로그인 직후 첫 명령 즉시 끊기"가 소진되는데, INBOX는 이 워밍업이 없어 매번 그대로
+    // 노출된다 — 동일하게 LIST를 한 번 태워 방어한다
+    await this._getFolderList();
+
+    const seenFilter = readFilter === 'is:unread' ? false : readFilter === 'is:read' ? true : null;
+    const matched = await this._withReconnectRetry(async () => {
+      const lock = await this.imap.getMailboxLock('INBOX', { readOnly: true });
+      const found = [];
+      try {
+        for await (const msg of this.imap.fetch('1:*', { envelope: true, flags: true }, { uid: true })) {
+          if (!msg.envelope || !msg.uid) continue;
+          if (seenFilter !== null && !!msg.flags?.has('\\Seen') !== seenFilter) continue;
+          const subject = msg.envelope.subject || '';
+          const f       = msg.envelope.from?.[0];
+          const from    = f ? (f.name ? `${f.name} <${f.address}>` : f.address) : '';
+
+          let isAd = detectAd(subject, from).isAd;
+          if (!isAd && bayesModel && !isShielded(subject)) {
+            isAd = bayes.classify(bayesModel, `${subject} ${from}`).isAd;
+          }
+          if (isAd) {
+            found.push({ id: encodeId('INBOX', msg.uid), uid: msg.uid, folder: 'INBOX' });
+          }
+        }
+      } finally { lock.release(); }
+      return found;
+    });
+    return matched.slice(-limit).reverse();
+  }
+
+  // 나이브 베이즈 학습용 — 폴더의 제목+발신자만 가볍게 수집. 없는 폴더는 조용히 스킵
+  // (계정마다 카테고리 폴더를 다 만들어두지 않았을 수 있어 에러로 스캔 전체를 막으면 안 됨)
+  // 폴더를 10여개 연달아 SELECT하면 Nate가 종종 BYE로 연결을 끊으므로,
+  // 폴더마다 연결 상태를 확인하고 필요하면 재연결한 뒤 진행한다 — 여기서 연결이
+  // 죽어도 절대 상위(scanInboxForAds의 본 스캔)로 전파되면 안 된다.
+  async fetchTrainingTexts(folder, limit = 800) {
+    try {
+      return await this._withReconnectRetry(async () => {
+        const lock = await this.imap.getMailboxLock(folder, { readOnly: true });
+        const texts = [];
+        try {
+          const allUids = await this.imap.search({ all: true }, { uid: true });
+          const uids = allUids.slice(-limit);
+          if (uids.length) {
+            for await (const msg of this.imap.fetch(uids, { envelope: true }, { uid: true })) {
+              if (!msg.envelope) continue;
+              const subject = msg.envelope.subject || '';
+              const f       = msg.envelope.from?.[0];
+              const from    = f ? (f.name ? `${f.name} <${f.address}>` : f.address) : '';
+              texts.push(`${subject} ${from}`);
+            }
+          }
+        } finally { lock.release(); }
+        return texts;
+      });
+    } catch (_) { return []; } // 이 폴더가 없거나 계속 실패해도 학습 전체를 막지 않음
   }
 
   // 폴더 내 전체 메시지를 대상 폴더로 이동 — Nate 등 1000개 슬라이딩 윈도우 서버 대응
   // 패스마다 락을 재취득: UID SEARCH ALL로 현재 창의 UID를 얻고 이동, 빈 폴더가 될 때까지 반복
+  // Nate처럼 MOVE(RFC 6851)가 없는 서버에서 ImapFlow의 messageMove는 COPY가 실패해도
+  // (대상 폴더 없음 등) 에러 없이 원본을 지워버린다 — 메일이 어디로도 안 가고 사라진다.
+  // 그래서 COPY 성공을 확인한 뒤에만 원본을 지운다.
+  async _moveChunk(uids, targetFolder) {
+    if (this.imap.capabilities.has('MOVE')) {
+      const moved = await this.imap.messageMove(uids, targetFolder, { uid: true });
+      if (!moved) throw new Error(`MOVE 실패 (대상: ${targetFolder})`);
+      return;
+    }
+    const copied = await this.imap.messageCopy(uids, targetFolder, { uid: true });
+    if (!copied) throw new Error(`COPY 실패 (대상: ${targetFolder}) — 원본은 지우지 않음`);
+    await this.imap.messageDelete(uids, { uid: true });
+  }
+
+  // 대상 폴더가 없으면 미리 만든다 (이미 있는 폴더에 CREATE를 보내면 Nate가 연결을 끊으므로 목록 확인 후)
+  async _ensureFolders(names) {
+    const existing = new Set(await this.listFolders());
+    for (const name of names) {
+      if (existing.has(name)) continue;
+      await this.createFolder(name);
+      logger.info('SYSTEM', `[IMAP] 폴더 "${name}" 생성`);
+    }
+    this._folderListCache = null;
+  }
+
+  // 폴더에 \Deleted 표시만 되고 지워지지 않은 메일의 표시를 해제한다. Nate는 UIDPLUS가 없어
+  // EXPUNGE가 폴더 전체의 \Deleted 메일을 지우므로, 이동 작업 전에 우리가 표시하지 않은
+  // 메일이 휩쓸려 지워지지 않게 한다. 표시 해제는 메일을 지우지 않으므로 항상 안전하다.
+  async clearDeletedFlags(folder) {
+    const lock = await this.imap.getMailboxLock(folder);
+    try {
+      const flagged = await this.imap.search({ deleted: true }, { uid: true });
+      for (let i = 0; i < flagged.length; i += 50) {
+        await this.imap.messageFlagsRemove(flagged.slice(i, i + 50), ['\\Deleted'], { uid: true });
+      }
+      return flagged.length;
+    } finally { lock.release(); }
+  }
+
+  async countMessages(folder) {
+    const lock = await this.imap.getMailboxLock(folder);
+    try {
+      return (await this.imap.search({ all: true }, { uid: true })).length;
+    } finally { lock.release(); }
+  }
+
+  async countDeletedFlagged(folder) {
+    const lock = await this.imap.getMailboxLock(folder);
+    try {
+      return (await this.imap.search({ deleted: true }, { uid: true })).length;
+    } finally { lock.release(); }
+  }
+
   async searchAndMoveAll(sourceFolder, targetFolder, chunkSize = 50, onProgress) {
     let totalMoved    = 0;
-    let targetCreated = false;
     let failStreak    = 0;
+
+    await this._ensureFolders([targetFolder]);
 
     for (let pass = 0; pass < 500; pass++) {
       // 연결이 죽어있으면 재연결
@@ -152,20 +463,11 @@ class ImapClient {
         if (!this.usable) { connLost = true; break; }
         const chunk = uids.slice(i, i + chunkSize);
         try {
-          await this.imap.messageMove(chunk, targetFolder, { uid: true });
+          await this._moveChunk(chunk, targetFolder);
         } catch (moveErr) {
           if (!this.usable) { connLost = true; break; }
-          const m = `${moveErr.message || ''} ${moveErr.responseText || ''}`.toLowerCase();
-          if (!targetCreated && (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such'))) {
-            try {
-              await this.imap.mailboxCreate(targetFolder);
-              try { await this.imap.mailboxSubscribe(targetFolder); } catch (_2) {}
-              targetCreated = true;
-              await this.imap.messageMove(chunk, targetFolder, { uid: true });
-            } catch (_) { connLost = !this.usable; break; }
-          } else {
-            break; // 알 수 없는 에러 → 이 패스 중단, 다음 패스에서 재시도
-          }
+          logger.warn('SYSTEM', `[IMAP] "${sourceFolder}" → "${targetFolder}" 이동 실패: ${moveErr.message}`);
+          break; // 이 패스 중단 — 이번 패스에서 하나도 못 옮겼으면 아래에서 종료
         }
         movedInPass += chunk.length;
         totalMoved  += chunk.length;
@@ -475,27 +777,18 @@ class ImapClient {
   async moveCategorizedFromFolder(folder, buckets) {
     const CHUNK  = 50;
     const result = { catMoved: {} };
-    const catCreated = {};
 
     const entries = Object.entries(buckets).filter(([, uids]) => uids.length > 0);
     if (!entries.length) return result;
 
     if (!this.usable) await this.reconnect();
+    await this._ensureFolders(entries.map(([targetFolder]) => targetFolder));
     const lock = await this.imap.getMailboxLock(folder);
     try {
       for (const [targetFolder, uids] of entries) {
         for (let i = 0; i < uids.length; i += CHUNK) {
           const chunk = uids.slice(i, i + CHUNK);
-          try {
-            await this.imap.messageMove(chunk, targetFolder, { uid: true });
-          } catch (err) {
-            const m = `${err.message || ''} ${err.responseText || ''}`.toLowerCase();
-            if (!catCreated[targetFolder] && (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such'))) {
-              await this.imap.mailboxCreate(targetFolder);
-              catCreated[targetFolder] = true;
-              await this.imap.messageMove(chunk, targetFolder, { uid: true });
-            } else throw err;
-          }
+          await this._moveChunk(chunk, targetFolder);
           result.catMoved[targetFolder] = (result.catMoved[targetFolder] || 0) + chunk.length;
         }
       }
@@ -583,31 +876,45 @@ class ImapClient {
     return result;
   }
 
-  async moveToWithCreate(encodedIds, targetFolder) {
+  // 지정한 UID만 정확히 지운다. Nate는 UIDPLUS가 없어 EXPUNGE가 "이 폴더에서 \\Deleted로
+  // 표시된 모든 메일"을 지우므로, 우리가 표시하기 전에 이미 \\Deleted인 메일이 있으면
+  // 무관한 메일까지 같이 지워질 수 있다 — 그래서 실행 전 항상 사전 점검한다.
+  // Nate는 명령에 OK를 응답하고도 (특히 새 연결의 처음 몇 개 폴더에서) 실제로는 반영하지
+  // 않는 경우가 있어("OneDrive 정리" 때 이미 겪음), 삭제 후 대상 UID가 실제로 사라졌는지
+  // SEARCH로 다시 확인한다. 남아있으면 재연결 후 다시 시도한다.
+  // UID를 전부 한 명령에 넣으면(수백 개) Nate가 자르거나 무시하는 것으로 보여, 다른
+  // 기능들과 동일하게 50개씩 나눠서 처리·검증한다.
+  async deleteExactUids(folder, uids) {
     const CHUNK = 50;
-    let count = 0;
-    for (const [folder, uids] of Object.entries(groupByFolder(encodedIds))) {
-      if (folder === targetFolder) { count += uids.length; continue; }
-      const lock = await this.imap.getMailboxLock(folder);
-      try {
-        let targetCreated = false;
-        for (let i = 0; i < uids.length; i += CHUNK) {
-          const chunk = uids.slice(i, i + CHUNK);
-          try {
-            await this.imap.messageMove(chunk, targetFolder, { uid: true });
-          } catch (moveErr) {
-            const m = `${moveErr.message || ''} ${moveErr.responseText || ''}`.toLowerCase();
-            if (!targetCreated && (m.includes('trycreate') || m.includes('nonexist') || m.includes('no such'))) {
-              await this.imap.mailboxCreate(targetFolder);
-              targetCreated = true;
-              await this.imap.messageMove(chunk, targetFolder, { uid: true });
-            } else throw moveErr;
+    const total = uids.length;
+    if (!total) return 0;
+    let deleted = 0;
+
+    for (let i = 0; i < uids.length; i += CHUNK) {
+      let target = uids.slice(i, i + CHUNK);
+      let done = false;
+      for (let attempt = 1; attempt <= 3 && !done; attempt++) {
+        const lock = await this.imap.getMailboxLock(folder);
+        let remaining;
+        try {
+          const preExisting = await this.imap.search({ deleted: true }, { uid: true });
+          if (preExisting.length) {
+            throw new Error(`"${folder}"에 이미 삭제 표시(\\Deleted)된 메일이 ${preExisting.length}개 있어 안전하게 처리할 수 없음 — 건너뜀`);
           }
-          count += chunk.length;
+          await this.imap.messageDelete(target, { uid: true });
+          remaining = await this.imap.search({ uid: target.join(',') }, { uid: true });
+        } finally { lock.release(); }
+
+        if (!remaining.length) { done = true; deleted += target.length; }
+        else {
+          logger.warn('SYSTEM', `[IMAP] "${folder}" 청크 삭제 후 검증 실패 — ${remaining.length}/${target.length}개 여전히 존재 (${attempt}회) — 재연결 후 재시도`);
+          await this.reconnect();
+          target = remaining;
         }
-      } finally { lock.release(); }
+      }
+      if (!done) throw new Error(`"${folder}"에서 일부 메일이 3회 시도 후에도 삭제되지 않음 (누적 삭제 ${deleted}/${total})`);
     }
-    return count;
+    return deleted;
   }
 
   async deleteMessages(encodedIds) {
@@ -649,16 +956,17 @@ class ImapClient {
   }
 
   async _moveTo(encodedIds, targetFolder) {
+    const resolvedTarget = await this.resolveFolder(targetFolder);
     const CHUNK = 50;
     let count = 0;
     for (const [folder, uids] of Object.entries(groupByFolder(encodedIds))) {
-      if (folder === targetFolder) { count += uids.length; continue; }
+      if (folder === resolvedTarget) { count += uids.length; continue; }
       // 폴더당 단일 잠금 — 청크마다 재취득 시 Nate가 BYE를 보내는 문제 방지
       const lock = await this.imap.getMailboxLock(folder);
       try {
         for (let i = 0; i < uids.length; i += CHUNK) {
           const chunk = uids.slice(i, i + CHUNK);
-          await this.imap.messageMove(chunk, targetFolder, { uid: true });
+          await this._moveChunk(chunk, resolvedTarget);
           count += chunk.length;
         }
       } finally { lock.release(); }

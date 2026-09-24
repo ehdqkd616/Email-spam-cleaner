@@ -16,6 +16,9 @@ token.json
 *.log
 logs/
 
+# 계정별 학습된 광고 판별 모델 (나이브 베이즈 캐시)
+data/
+
 # 빌드 산출물
 dist-electron/
 

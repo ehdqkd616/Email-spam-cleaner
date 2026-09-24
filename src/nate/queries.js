@@ -1,9 +1,11 @@
 // Nate Mail IMAP 검색 기준
 // adFolder: 광고함 (Nate 고유 폴더명)
 // spamFolder: 스팸 (Nate는 '스팸메일함' 아닌 '스팸')
+//
+// 광고 키워드 / noreply 발신자 목록은 Gmail·Naver와 공유 (src/scanKeywords.js)
+// — 서비스마다 기준이 달라 결과가 달라지는 문제를 막기 위함
 
-const AD_KEYWORDS     = ['광고', '할인', '이벤트', '쿠폰', '무료', '특가'];
-const NOREPLY_SENDERS = ['noreply', 'no-reply', 'notification', 'alert', 'mailer'];
+const { AD_KEYWORDS, NOREPLY_SENDERS } = require('../scanKeywords');
 
 const QUERIES = {
   adFolder: {
@@ -16,7 +18,7 @@ const QUERIES = {
   },
   spamFolder: {
     name: '스팸 메일함',
-    description: '스팸 메일함 전체',
+    description: 'Nate가 자동 분류한 스팸 메일함 전체',
     folder: '스팸',
     baseCriteria: {},
     applyDateFilter: false,
@@ -24,20 +26,34 @@ const QUERIES = {
   },
   inboxKeywords: {
     name: '받은편지함 광고성 키워드',
-    description: '받은편지함 내 광고·할인·이벤트 키워드 (30일 이상)',
+    description: '광고 판별 엔진으로 자동 감지 (키워드+할인율+마케팅 발신 도메인 등 종합 판단, 받은편지함 전체)',
     folder: 'INBOX',
+    // matcher: 'detectAd'가 있으면 scanInboxForAds()가 대신 쓰이므로 baseCriteria는 미사용 폴백
     baseCriteria: { or: AD_KEYWORDS.map((kw) => ({ subject: kw })) },
-    applyDateFilter: true,
+    applyDateFilter: false,
+    matcher: 'detectAd',
     safe: false,
   },
   inboxNoreply: {
     name: '받은편지함 자동 발송',
-    description: '받은편지함 내 noreply·알림 주소 발신 (30일 이상)',
+    description: 'noreply·알림 주소에서 온 메일 (받은편지함 전체, 기간 제한 없음)',
     folder: 'INBOX',
     baseCriteria: { or: NOREPLY_SENDERS.map((kw) => ({ from: kw })) },
-    applyDateFilter: true,
+    applyDateFilter: false,
     safe: false,
   },
+};
+
+// 나이브 베이즈 학습용 정답 데이터 폴더 — 계정에 이미 분류돼 있는 폴더를 그대로 활용
+// (광고: Nate가 자체 분류한 광고함 / 정상: 이 앱의 자동분류가 만든 카테고리 폴더들, src/categories.js 참고)
+// 계정에 해당 폴더가 없으면 fetchTrainingTexts()가 조용히 스킵하므로 안전함
+const BAYES_TRAIN = {
+  adFolders: ['광고함', '광고·홍보'],
+  hamFolders: [
+    '결제·영수증', '주문·배송', '예약·예매', '구독·멤버십',
+    '계정·서비스', '금융·은행', 'SNS·커뮤니티', '이벤트·행사',
+    '교육·학습', '공공·기관', '보안알림',
+  ],
 };
 
 function buildCriteria(key, readFilter) {
@@ -49,4 +65,4 @@ function buildCriteria(key, readFilter) {
   return { ...def.baseCriteria, ...readPart, ...datePart };
 }
 
-module.exports = { QUERIES, buildCriteria };
+module.exports = { QUERIES, buildCriteria, BAYES_TRAIN };

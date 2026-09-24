@@ -28,6 +28,28 @@ class GmailClient {
     return ids;
   }
 
+  // 다른 프로바이더(searchInFolder(folder, criteria))와 동일한 시그니처를 맞추기 위한 어댑터.
+  // Gmail은 폴더 개념이 없어 folder 인자는 쓰지 않고, criteria 자리에 온 Gmail 검색 쿼리 문자열을 그대로 사용
+  async searchInFolder(_folder, query, limit = 5000) {
+    return this.searchMessages(query, limit);
+  }
+
+  // 받은편지함 전체를 matcher.js의 detectAd() 스코어링 엔진으로 판별 (Naver·Nate와 동일 기준)
+  async scanInboxForAds(readFilter, limit = 2000) {
+    const { detectAd } = require('../matcher');
+    const readQ = readFilter === 'is:unread' ? 'is:unread ' : readFilter === 'is:read' ? 'is:read ' : '';
+    const ids   = await this.searchMessages(`in:inbox ${readQ}`.trim(), limit);
+    if (!ids.length) return [];
+    const metas = await this.getMetadata(ids.map((m) => m.id));
+    return metas
+      .filter((m) => {
+        const subject = m.payload?.headers?.find((h) => h.name === 'Subject')?.value || '';
+        const from    = m.payload?.headers?.find((h) => h.name === 'From')?.value || '';
+        return detectAd(subject, from).isAd;
+      })
+      .map((m) => ({ id: m.id }));
+  }
+
   async getMetadata(messageIds) {
     const results = [];
     for (let i = 0; i < messageIds.length; i += CONCURRENCY) {

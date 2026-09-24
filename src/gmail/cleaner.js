@@ -27,10 +27,12 @@ async function scanAll(gmailClient, selectedKeys, readFilter = 'is:unread') {
   for (const key of selectedKeys) {
     const def = QUERIES[key];
     if (!def) continue;
-    const query   = buildQuery(key, readFilter);
+    const query   = def.matcher === 'detectAd' ? null : buildQuery(key, readFilter);
     const spinner = ora(`[${def.name}] 검색 중...`).start();
     try {
-      const messages = await gmailClient.searchMessages(query);
+      const messages = def.matcher === 'detectAd'
+        ? await gmailClient.scanInboxForAds(readFilter)
+        : await gmailClient.searchMessages(query);
       spinner.succeed(`[${def.name}] ${chalk.yellow(messages.length + '개')} 발견`);
       logger.info('SCAN', `[Gmail][${def.name}] ${messages.length}개 발견`, true);
       results[key] = { ...def, query, messages };

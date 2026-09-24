@@ -22,17 +22,18 @@ function checkPreservation(msg) {
 }
 
 // QUERIES와 buildCriteria를 받아 provider에 독립적인 cleaner 반환
-function createCleaner({ QUERIES, buildCriteria }) {
+function createCleaner({ QUERIES, buildCriteria, BAYES_TRAIN }) {
 
   async function scanAll(client, selectedKeys, readFilter = 'is:unread') {
     const results = {};
     for (const key of selectedKeys) {
       const def = QUERIES[key];
       if (!def) continue;
-      const criteria = buildCriteria(key, readFilter);
       const spinner  = ora(`[${def.name}] 검색 중...`).start();
       try {
-        const messages = await client.searchInFolder(def.folder, criteria);
+        const messages = def.matcher === 'detectAd'
+          ? await client.scanInboxForAds(readFilter, undefined, BAYES_TRAIN)
+          : await client.searchInFolder(def.folder, buildCriteria(key, readFilter));
         spinner.succeed(`[${def.name}] ${chalk.yellow(messages.length + '개')} 발견`);
         logger.info('SCAN', `[IMAP][${def.name}] ${messages.length}개 발견`, true);
         results[key] = { ...def, messages };

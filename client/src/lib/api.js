@@ -61,6 +61,33 @@ export function categorizeStream(provider, onEvent, onError) {
   return () => es.close();
 }
 
+export function categorizeAllStream(provider, onEvent, onError) {
+  const es = new EventSource(`/api/mail/${provider}/categorize-all`, { withCredentials: true });
+  ['log', 'complete', 'error'].forEach((ev) => {
+    es.addEventListener(ev, (e) => onEvent(ev, JSON.parse(e.data)));
+  });
+  es.onerror = (e) => { onError(e); es.close(); };
+  return () => es.close();
+}
+
+export function findDuplicatesStream(provider, onEvent, onError) {
+  const es = new EventSource(`/api/mail/${provider}/find-duplicates`, { withCredentials: true });
+  ['log', 'complete', 'error'].forEach((ev) => {
+    es.addEventListener(ev, (e) => onEvent(ev, JSON.parse(e.data)));
+  });
+  es.onerror = (e) => { onError(e); es.close(); };
+  return () => es.close();
+}
+
+export function dedupeStream(provider, onEvent, onError) {
+  const es = new EventSource(`/api/mail/${provider}/dedupe`, { withCredentials: true });
+  ['log', 'complete', 'error'].forEach((ev) => {
+    es.addEventListener(ev, (e) => onEvent(ev, JSON.parse(e.data)));
+  });
+  es.onerror = (e) => { onError(e); es.close(); };
+  return () => es.close();
+}
+
 export function migrateFoldersStream(provider, onEvent, onError) {
   const es = new EventSource(`/api/mail/${provider}/migrate-folders`, { withCredentials: true });
   ['log', 'complete', 'error'].forEach((ev) => {

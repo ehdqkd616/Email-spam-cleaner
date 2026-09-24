@@ -9,8 +9,8 @@
 // ── 1. 광고 확정 신호 ─────────────────────────────────────────────
 // 하나라도 매칭 → 광고로 확정
 const AD_DEFINITE = [
-  /\[광고\]/,                                          // 법정 광고 표기 (정보통신망법)
-  /\[AD\]/i,
+  /[([]\s*광고\s*[)\]]/,                                // 법정 광고 표기 (정보통신망법 — 실무에선 (광고)가 대부분, [광고]도 허용)
+  /[([]\s*AD\s*[)\]]/i,
   /\d+\s*%\s*(할인|off|OFF|세일|SALE|절약)/,          // 할인율 표현
   /최대\s*\d+\s*%/,                                    // 최대 N%
   /\d+[만천]\s*원\s*(할인|적립|증정|지원|쿠폰)/,       // N만원 할인/증정
@@ -132,6 +132,18 @@ const TRANSACTIONAL_SHIELDS = [
   /(재산세|자동차세|지방세|소득세)\s*(납부|고지)/,
   /전자\s*(고지서|납부)\s*(안내|발송)/,
   /(건강보험|국민연금|고용보험)\s*(안내|납부|고지)/,
+
+  // 정기 거래내역서·명세서
+  /(월간|주간|일일)?\s*거래\s*내역서/,
+  /계좌\s*(거래|입출금)\s*내역서/,
+
+  // 이용권·구독권 등록/발급 (구매 유도 아닌 등록 확인)
+  /이용권\s*(등록|발급|사용|적용)\s*(완료|안내|되었|합니다)?/,
+
+  // 사진·기록 회고 다이제스트 (네이버/카카오/구글포토 등 "이 날의 추억" 류)
+  /(이|그)\s*날의\s*추억/,
+  /지난\s*추억\s*(모아|다시)/,
+  /(추억|메모리즈)\s*(다이제스트|리마인드|되돌아보기)/,
 ];
 
 // ── 4. 마케팅 발신 플랫폼 패턴 ──────────────────────────────────
@@ -154,6 +166,16 @@ const MARKETING_SENDERS = [
 // ── 핵심 API ─────────────────────────────────────────────────────
 
 /**
+ * 트랜잭션 보호 패턴에 해당하는 제목인지 (실제 알림/거래 메일 → 광고 판정 절대 금지)
+ * detectAd() 내부에서 쓰지만, 다른 판별기(예: 나이브 베이즈)가 최종 판정 전에
+ * 안전장치로 재사용할 수 있도록 별도로 export한다.
+ * @param {string} subject
+ */
+function isShielded(subject) {
+  return TRANSACTIONAL_SHIELDS.some((p) => p.test(subject || ''));
+}
+
+/**
  * 이메일이 광고인지 분석
  * @param {string} subject 제목
  * @param {string} from    발신자
@@ -164,7 +186,7 @@ function detectAd(subject, from) {
   const sender = from    || '';
 
   // 트랜잭션 보호: 실제 알림 메일이면 광고 아님
-  if (TRANSACTIONAL_SHIELDS.some((p) => p.test(subj))) {
+  if (isShielded(subj)) {
     return { isAd: false, confidence: 0 };
   }
 
@@ -213,4 +235,4 @@ function matchCategory(subject, from, categories) {
   return null;
 }
 
-module.exports = { detectAd, matchCategory };
+module.exports = { detectAd, matchCategory, isShielded };

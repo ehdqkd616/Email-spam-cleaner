@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { api, scanStream, categorizeStream, migrateFoldersStream } from '../lib/api';
+import { api, scanStream, categorizeStream, categorizeAllStream, findDuplicatesStream, dedupeStream, migrateFoldersStream } from '../lib/api';
 import { PROVIDERS, cn } from '../lib/utils';
 import Button from '../components/Button';
 import Toast from '../components/Toast';
@@ -58,6 +58,7 @@ export default function Dashboard() {
   const [sidebarOpen, setSidebar] = useState(false);
   const [serverLogs, setServerLogs]     = useState([]);
   const [logFilter, setLogFilter]       = useState({ level: '', category: '' });
+  const [expandedKeys, setExpandedKeys] = useState([]);
   const [logLoading, setLogLoading]     = useState(false);
   const [logDate, setLogDate]           = useState('');
   const [logDates, setLogDates]         = useState([]);
@@ -84,7 +85,7 @@ export default function Dashboard() {
     const s = statusOverride || status;
     if (!s[key]?.connected) return;
     select(key);
-    setScan(null); setProgress([]); setLogs([]); setSidebar(false);
+    setScan(null); setProgress([]); setLogs([]); setSidebar(false); setExpandedKeys([]);
     try {
       const q = await api.getQueries(key);
       setQueries(q);
@@ -99,7 +100,7 @@ export default function Dashboard() {
 
   function handleScan() {
     if (!checkedKeys.length) return showToast('카테고리를 선택해주세요', 'error');
-    setLoading('scan'); setScan(null); setProgress([]);
+    setLoading('scan'); setScan(null); setProgress([]); setExpandedKeys([]);
     const stop = scanStream(selected, checkedKeys, readFilter,
       (ev, data) => {
         if (ev === 'progress') setProgress((p) => [...p.filter((x) => x.key !== data.key), data]);
@@ -118,7 +119,7 @@ export default function Dashboard() {
     try {
       const { count } = await api.execute(selected, { ids, action });
       showToast(`${count}개 메일 ${labels[action]} 완료!`);
-      setScan(null); setProgress([]);
+      setScan(null); setProgress([]); setExpandedKeys([]);
     } catch (err) { showToast(err.message, 'error'); }
     finally { setLoading(''); }
   }
@@ -135,6 +136,49 @@ export default function Dashboard() {
         if (ev === 'error')   { showToast(data.message, 'error'); setLoading(''); stop(); }
       },
       () => { showToast('분류 오류', 'error'); setLoading(''); }
+    );
+  }
+
+  function handleCategorizeAll() {
+    setLoading('categorize-all'); setLogs([]);
+    const stop = categorizeAllStream(selected,
+      (ev, data) => {
+        if (ev === 'log')     setLogs((l) => [...l, data.message]);
+        if (ev === 'complete') {
+          showToast('전체 재분류 완료!'); setLoading(''); stop();
+          if (historyOpen) fetchHistory(); else fetchHistory().then(() => {});
+        }
+        if (ev === 'error')   { showToast(data.message, 'error'); setLoading(''); stop(); }
+      },
+      () => { showToast('전체 재분류 오류', 'error'); setLoading(''); }
+    );
+  }
+
+  function handleFindDuplicates() {
+    setLoading('find-duplicates'); setLogs([]);
+    const stop = findDuplicatesStream(selected,
+      (ev, data) => {
+        if (ev === 'log')     setLogs((l) => [...l, data.message]);
+        if (ev === 'complete') {
+          showToast(data.dupGroups > 0 ? `중복 메일 ${data.dupTotal}통 발견 (그룹 ${data.dupGroups}개) — 이동/삭제는 하지 않았습니다` : '중복 메일 없음');
+          setLoading(''); stop();
+        }
+        if (ev === 'error')   { showToast(data.message, 'error'); setLoading(''); stop(); }
+      },
+      () => { showToast('중복 검사 오류', 'error'); setLoading(''); }
+    );
+  }
+
+  function handleDedupe() {
+    if (!window.confirm('중복 메일을 삭제합니다. 그룹당 1통만 남기고 나머지를 영구 삭제합니다. 계속할까요?')) return;
+    setLoading('dedupe'); setLogs([]);
+    const stop = dedupeStream(selected,
+      (ev, data) => {
+        if (ev === 'log')     setLogs((l) => [...l, data.message]);
+        if (ev === 'complete') { showToast(`중복 삭제 완료 — ${data.deleted}통 삭제`); setLoading(''); stop(); }
+        if (ev === 'error')   { showToast(data.message, 'error'); setLoading(''); stop(); }
+      },
+      () => { showToast('중복 삭제 오류', 'error'); setLoading(''); }
     );
   }
 
@@ -346,6 +390,19 @@ export default function Dashboard() {
                       <Button variant="primary" size="md" onClick={handleCategorize} loading={loading === 'categorize'} disabled={!!loading}>
                         분류 실행
                       </Button>
+                      <Button variant="outline" size="md" onClick={handleCategorizeAll} loading={loading === 'categorize-all'} disabled={!!loading}>
+                        전체 재분류 실행
+                      </Button>
+                      {(selected === 'nate' || selected === 'naver') && (
+                        <Button variant="outline" size="md" onClick={handleFindDuplicates} loading={loading === 'find-duplicates'} disabled={!!loading}>
+                          중복 메일 찾기 (읽기전용)
+                        </Button>
+                      )}
+                      {(selected === 'nate' || selected === 'naver') && (
+                        <Button variant="outline" size="md" onClick={handleDedupe} loading={loading === 'dedupe'} disabled={!!loading}>
+                          중복 메일 삭제 실행
+                        </Button>
+                      )}
                       <Button variant="outline" size="md" onClick={handleMigrateFolders} loading={loading === 'migrate'} disabled={!!loading}>
                         폴더 이름 정리
                       </Button>
@@ -445,16 +502,21 @@ export default function Dashboard() {
                     {progress.length > 0 && (
                       <div style={{ marginTop: 20, background: '#f8fafc', borderRadius: 14, padding: '16px 20px', border: '1px solid #e2e8f0', display: 'flex', flexDirection: 'column', gap: 10 }}>
                         {progress.map((p) => (
-                          <div key={p.key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <div key={p.key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
                             <span style={{ fontSize: 13, color: '#475569' }}>{p.name}</span>
-                            <span style={{
-                              fontSize: 12, fontWeight: 700, padding: '3px 10px', borderRadius: 999,
-                              background: p.status === 'done' ? '#dcfce7' : '#dbeafe',
-                              color: p.status === 'done' ? '#16a34a' : '#2563eb',
-                              border: `1px solid ${p.status === 'done' ? '#bbf7d0' : '#bfdbfe'}`,
-                              transition: 'all 0.3s ease',
-                            }}>
-                              {p.status === 'done' ? `✓ ${p.count}개` : '스캔 중...'}
+                            <span
+                              title={p.status === 'error' ? p.message : undefined}
+                              style={{
+                                fontSize: 12, fontWeight: 700, padding: '3px 10px', borderRadius: 999,
+                                background: p.status === 'done' ? '#dcfce7' : p.status === 'error' ? '#fee2e2' : '#dbeafe',
+                                color: p.status === 'done' ? '#16a34a' : p.status === 'error' ? '#dc2626' : '#2563eb',
+                                border: `1px solid ${p.status === 'done' ? '#bbf7d0' : p.status === 'error' ? '#fecaca' : '#bfdbfe'}`,
+                                transition: 'all 0.3s ease',
+                                maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                              }}>
+                              {p.status === 'done' ? `✓ ${p.count}개`
+                                : p.status === 'error' ? `⚠ 실패: ${p.message}`
+                                : '스캔 중...'}
                             </span>
                           </div>
                         ))}
@@ -468,12 +530,17 @@ export default function Dashboard() {
                           <p style={{ fontWeight: 800, color: '#1e293b', fontSize: 15 }}>
                             총 <span style={{ fontSize: 26, color: '#2563eb' }}>{totalScanned}</span>개 발견
                           </p>
-                          <Button variant="ghost" size="xs" onClick={() => { setScan(null); setProgress([]); }} darkRipple className="text-slate-400">초기화</Button>
+                          <Button variant="ghost" size="xs" onClick={() => { setScan(null); setProgress([]); setExpandedKeys([]); }} darkRipple className="text-slate-400">초기화</Button>
                         </div>
 
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 24 }}>
-                          {Object.entries(scanResult).map(([key, result]) =>
-                            result.count > 0 ? (
+                          {Object.entries(scanResult).map(([key, result]) => {
+                            if (!(result.count > 0)) return null;
+                            const expanded   = expandedKeys.includes(key);
+                            const samples    = result.samples || [];
+                            const shown      = expanded ? samples : samples.slice(0, 3);
+                            const notFetched = result.count - samples.length; // 서버가 애초에 못 가져온 나머지 (샘플 상한 초과분)
+                            return (
                               <div key={key} style={{ background: '#f8fafc', borderRadius: 14, border: '1px solid #e2e8f0', overflow: 'hidden', transition: 'box-shadow 0.2s' }}
                                 onMouseEnter={(e) => e.currentTarget.style.boxShadow = '0 4px 12px rgba(0,0,0,0.07)'}
                                 onMouseLeave={(e) => e.currentTarget.style.boxShadow = 'none'}
@@ -482,8 +549,8 @@ export default function Dashboard() {
                                   <span style={{ fontSize: 13, fontWeight: 700, color: '#334155' }}>{result.name}</span>
                                   <span style={{ fontSize: 13, fontWeight: 800, color: '#2563eb', background: '#eff6ff', border: '1px solid #bfdbfe', padding: '2px 10px', borderRadius: 999 }}>{result.count}개</span>
                                 </div>
-                                {result.samples?.slice(0, 3).map((s, i) => (
-                                  <div key={i} style={{ padding: '10px 16px', borderBottom: i < 2 && result.samples.length > 1 ? '1px solid #f1f5f9' : 'none', transition: 'background 0.1s' }}
+                                {shown.map((s, i) => (
+                                  <div key={i} style={{ padding: '10px 16px', borderBottom: i < shown.length - 1 ? '1px solid #f1f5f9' : 'none', transition: 'background 0.1s' }}
                                     onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.7)'}
                                     onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
                                   >
@@ -491,12 +558,38 @@ export default function Dashboard() {
                                     <p style={{ fontSize: 11, color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2 }}>{s.from}</p>
                                   </div>
                                 ))}
-                                {result.count > 3 && (
-                                  <div style={{ padding: '8px 16px', fontSize: 12, color: '#94a3b8' }}>+ {result.count - 3}개 더...</div>
+                                {!expanded && samples.length > 3 && (
+                                  <div
+                                    role="button" tabIndex={0}
+                                    onClick={() => setExpandedKeys((k) => [...k, key])}
+                                    onKeyDown={(e) => { if (e.key === 'Enter') setExpandedKeys((k) => [...k, key]); }}
+                                    style={{ padding: '8px 16px', fontSize: 12, color: '#2563eb', fontWeight: 600, cursor: 'pointer' }}
+                                    onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.7)'}
+                                    onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+                                  >
+                                    + {samples.length - 3}개 더 보기
+                                  </div>
+                                )}
+                                {expanded && samples.length > 3 && (
+                                  <div
+                                    role="button" tabIndex={0}
+                                    onClick={() => setExpandedKeys((k) => k.filter((x) => x !== key))}
+                                    onKeyDown={(e) => { if (e.key === 'Enter') setExpandedKeys((k) => k.filter((x) => x !== key)); }}
+                                    style={{ padding: '8px 16px', fontSize: 12, color: '#94a3b8', fontWeight: 600, cursor: 'pointer' }}
+                                    onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.7)'}
+                                    onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+                                  >
+                                    접기
+                                  </div>
+                                )}
+                                {notFetched > 0 && (
+                                  <div style={{ padding: '8px 16px', fontSize: 12, color: '#94a3b8', borderTop: '1px solid #f1f5f9' }}>
+                                    그 외 {notFetched}개 더 있음 (미리보기는 최대 {samples.length}개까지 — 아래 실행 버튼은 전체 {result.count}개에 적용됩니다)
+                                  </div>
                                 )}
                               </div>
-                            ) : null
-                          )}
+                            );
+                          })}
                         </div>
 
                         {/* 실행 버튼 */}
