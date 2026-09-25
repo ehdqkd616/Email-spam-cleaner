@@ -94,6 +94,23 @@ async function scanAndDedupe(client, log) {
   return dedupeGroups(client, dupGroups, log);
 }
 
+// 분류로 옮긴 결과를 기록한다 — 카테고리별 개수와 함께 제목을 최대 5개씩 로그에 남겨,
+// 나중에 어떤 메일이 어디로 갔는지 확인할 수 있게 한다. 옮긴 UID는 seen에 넣어 다시 옮기지 않는다.
+function recordMoves(moveResult, { subjects, seen, catTotals, CATEGORIES, log }) {
+  let moved = 0;
+  for (const [folderName, count] of Object.entries(moveResult.catMoved || {})) {
+    const uids = moveResult.movedUids?.[folderName] || [];
+    uids.forEach((u) => seen.add(u));
+    const cat = CATEGORIES.find((c) => c.name === folderName);
+    catTotals[cat?.key || folderName] = (catTotals[cat?.key || folderName] || 0) + count;
+    moved += count;
+    log('success', `  ✓ [${folderName}] ${count}개 이동`);
+    for (const u of uids.slice(0, 5)) log('info', `      · ${subjects?.[u] || '(제목 확인 불가)'}`);
+    if (uids.length > 5) log('info', `      · 외 ${uids.length - 5}통`);
+  }
+  return moved;
+}
+
 // ── 클라이언트 생성 헬퍼 ───────────────────────────────────────────
 async function buildClient(provider, sessionData) {
   logger.info('SYSTEM', `[${provider}] 클라이언트 연결 중...`);
@@ -374,7 +391,7 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
     const seen      = new Set(); // 이미 이동을 요청한 UID — 이동 직후 Nate 목록이 갱신 전이어도 다시 옮기지 않는다
 
     for (let pass = 0; pass < 50; pass++) {
-      const { buckets, total, error: fetchErr } = await client.fetchFolderClassified('INBOX', matchFn, (n) => {
+      const { buckets, subjects, total, error: fetchErr } = await client.fetchFolderClassified('INBOX', matchFn, (n) => {
         if (n % 1000 === 0) log('info', `  📧 ${n.toLocaleString()}개 조회 중...`);
       });
       if (fetchErr) {
@@ -400,13 +417,9 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
       try {
         const moveResult = await client.moveCategorizedFromFolder('INBOX', fresh);
         Object.values(fresh).forEach((uids) => uids.forEach((u) => seen.add(u)));
-        for (const [folderName, count] of Object.entries(moveResult.catMoved)) {
-          const cat = CATEGORIES.find(c => c.name === folderName);
-          totalMoved += count;
-          catTotals[cat?.key || folderName] = (catTotals[cat?.key || folderName] || 0) + count;
-          log('success', `  ✓ [${folderName}] ${count}개 이동`);
-        }
+        totalMoved += recordMoves(moveResult, { subjects, seen, catTotals, CATEGORIES, log });
       } catch (moveErr) {
+        if (moveErr.partial) totalMoved += recordMoves(moveErr.partial, { subjects, seen, catTotals, CATEGORIES, log });
         log('error', `  ⚠️ 이동 실패: ${moveErr.message} — 중복 이동을 막기 위해 여기서 중단합니다.`);
         moveFailed = true;
         break;
@@ -479,6 +492,7 @@ router.get('/:provider/categorize-all', requireAuth, async (req, res) => {
     const catTotals     = {};
     let   totalMoved    = 0;
     let   tempHasEmails = false;
+    let   restoredEarly = 0; // 2단계에서 바로 받은편지함으로 돌려보낸 메일 수
 
     // JS matchFn: IMAP SEARCH 대신 FETCH한 envelope을 직접 매칭
     const matchFn = (subject, from) => {
@@ -603,9 +617,16 @@ router.get('/:provider/categorize-all', requireAuth, async (req, res) => {
 
       // ── Phase 2: TEMP FETCH → matchFn → MOVE ──
       log('info', '📂 Phase 2: 임시 폴더에서 카테고리 분류 중...');
-      const MAX_PASSES = 2000; // 대용량 메일함 대응 (50만 개까지 처리 가능)
+      // Nate는 같은 연결 안에서는 이미 옮긴 메일을 FETCH에 계속 돌려준다(갱신 지연) — 예전에는
+      // 같은 메일을 매번 다시 옮기고 다시 세서 "690개 분류"처럼 부풀었다. 이번 실행에서 옮긴 UID는
+      // 건너뛰고, 옮길 게 없어지면 새 연결로 한 번 더 확인한 뒤(1000통 표시 창이 밀려 새로
+      // 드러난 메일 처리) 그래도 없으면 끝낸다.
+      const MAX_PASSES = 2000;
+      const seen = new Set();
       let consecutiveLockFails = 0;
       let consecutiveMoveFails = 0; // 이동이 계속 실패하면 몇 시간씩 같은 실패를 반복하지 않고 복원 단계로 넘어간다
+      let consecutiveFetchErrs = 0;
+      let confirmedOnFreshConn = false;
 
       for (let pass = 0; pass < MAX_PASSES; pass++) {
         let fetchResult;
@@ -623,37 +644,61 @@ router.get('/:provider/categorize-all', requireAuth, async (req, res) => {
           await safeReconnect();
           continue;
         }
-        if (fetchResult.error) log('error', `⚠️ FETCH 중단: ${fetchResult.error.message}`);
 
-        const { buckets, total, error: fetchErr } = fetchResult;
-        const catCount = Object.values(buckets).reduce((a, arr) => a + arr.length, 0);
-        log('info', `  조회 ${total.toLocaleString()}개, 분류 대상 ${catCount.toLocaleString()}개`);
-
-        if (catCount > 0) {
-          try {
-            if (!client.usable) await safeReconnect();
-            const moveResult = await client.moveCategorizedFromFolder(TEMP_FOLDER, buckets);
-            consecutiveMoveFails = 0;
-            for (const [folderName, count] of Object.entries(moveResult.catMoved)) {
-              const cat  = CATEGORIES.find(c => c.name === folderName);
-              totalMoved += count;
-              catTotals[cat?.key || folderName] = (catTotals[cat?.key || folderName] || 0) + count;
-              log('success', `  ✓ [${folderName}] ${count}개 이동`);
-            }
-          } catch (moveErr) {
-            log('error', `  ⚠️ MOVE 실패: ${moveErr.message}`);
-            consecutiveMoveFails++;
-            if (consecutiveMoveFails >= 3) {
-              log('error', '  ⚠️ 이동이 3회 연속 실패 — 분류를 멈추고 복원 단계로 넘어갑니다');
-              break;
-            }
-            await safeReconnect();
-            continue;
-          }
+        const { buckets, subjects, unmatched, total, error: fetchErr } = fetchResult;
+        if (fetchErr) {
+          log('error', `⚠️ FETCH 중단: ${fetchErr.message}`);
+          if (++consecutiveFetchErrs >= 3) break;
+        } else {
+          consecutiveFetchErrs = 0;
         }
 
-        if (catCount === 0 && !fetchErr) break;
-        if (fetchErr) await safeReconnect();
+        const fresh = {};
+        let freshCount = 0;
+        for (const [name, uids] of Object.entries(buckets)) {
+          const list = uids.filter((u) => !seen.has(u));
+          if (list.length) { fresh[name] = list; freshCount += list.length; }
+        }
+
+        // 분류 대상이 아닌 메일은 이번에 확인이 끝났으므로 바로 받은편지함으로 돌려보낸다 — 임시 폴더에
+        // 남겨두면 Nate의 1000통 표시 창을 계속 차지해 그 뒤의 메일이 영영 안 보인다
+        const freshOthers = (unmatched || []).filter((u) => !seen.has(u));
+
+        if (freshCount === 0 && freshOthers.length === 0) {
+          if (fetchErr) { await safeReconnect(); continue; }
+          if (confirmedOnFreshConn) break;
+          confirmedOnFreshConn = true; // 새 연결로 한 번 더 확인
+          await safeReconnect();
+          continue;
+        }
+        confirmedOnFreshConn = false;
+        log('info', `  조회 ${total.toLocaleString()}개 — 분류 대상 ${freshCount.toLocaleString()}개, 해당 없음 ${freshOthers.length.toLocaleString()}개`);
+
+        try {
+          if (!client.usable) await safeReconnect();
+          if (freshCount) {
+            const moveResult = await client.moveCategorizedFromFolder(TEMP_FOLDER, fresh);
+            totalMoved += recordMoves(moveResult, { subjects, seen, catTotals, CATEGORIES, log });
+          }
+          if (freshOthers.length) {
+            const back = await client.moveUids(TEMP_FOLDER, freshOthers, 'INBOX');
+            back.forEach((u) => seen.add(u));
+            restoredEarly += back.length;
+            log('info', `  ↩️ 해당 없음 ${back.length.toLocaleString()}개 받은편지함으로 복원`);
+          }
+          consecutiveMoveFails = 0;
+        } catch (moveErr) {
+          if (Array.isArray(moveErr.partial)) { moveErr.partial.forEach((u) => seen.add(u)); restoredEarly += moveErr.partial.length; }
+          else if (moveErr.partial) totalMoved += recordMoves(moveErr.partial, { subjects, seen, catTotals, CATEGORIES, log });
+          log('error', `  ⚠️ MOVE 실패: ${moveErr.message}`);
+          consecutiveMoveFails++;
+          if (consecutiveMoveFails >= 3) {
+            log('error', '  ⚠️ 이동이 3회 연속 실패 — 분류를 멈추고 복원 단계로 넘어갑니다');
+            break;
+          }
+          await safeReconnect();
+          continue;
+        }
       }
 
       } // end if (tempHasEmails) — Phase 2
@@ -670,9 +715,10 @@ router.get('/:provider/categorize-all', requireAuth, async (req, res) => {
           await safeReconnect();
           restored = await client.searchAndMoveAll(TEMP_FOLDER, 'INBOX', 200);
         }
-        if (restored > 0) {
-          log('info', `  ↩️ ${restored.toLocaleString()}개 복원 완료`);
-          logger.info('CATEGORIZE', `[${provider}] 임시 폴더 복원 완료 — ${restored}개`);
+        const restoredTotal = restoredEarly + restored;
+        if (restoredTotal > 0) {
+          log('info', `  ↩️ 분류 대상이 아닌 메일 총 ${restoredTotal.toLocaleString()}개 받은편지함으로 복원 완료`);
+          logger.info('CATEGORIZE', `[${provider}] 받은편지함 복원 완료 — ${restoredTotal}개`);
         } else {
           log('info', `  복원할 미분류 메일 없음`);
         }

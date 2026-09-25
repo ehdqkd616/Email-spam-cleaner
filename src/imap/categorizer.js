@@ -120,17 +120,35 @@ async function cleanupOldFolders(client) {
   for (const folder of sorted) {
     const spinner = ora(`  ${folder} 처리 중...`).start();
     try {
-      const messages = await client.searchInFolder(folder, {}, 9999);
-      if (messages.length) {
-        await client.moveTo(messages.map((m) => m.id), 'INBOX');
-        restored += messages.length;
+      let moved = 0;
+      if (typeof client.searchAndMoveAll === 'function') {
+        // IMAP: 1000통 표시 한계를 넘어 전부 옮김 (searchInFolder는 보이는 1000통까지만 돌려줌)
+        moved = await client.searchAndMoveAll(folder, 'INBOX');
+      } else {
+        const messages = await client.searchInFolder(folder, {}, 9999);
+        if (messages.length) {
+          await client.moveTo(messages.map((m) => m.id), 'INBOX');
+          moved = messages.length;
+        }
+      }
+      restored += moved;
+
+      // 폴더를 지우면 안에 남은 메일도 같이 지워지므로, 비어 있는 게 확인될 때만 지운다
+      if (typeof client.reconnect === 'function') await client.reconnect();
+      const left = typeof client.countMessages === 'function'
+        ? await client.countMessages(folder)
+        : (await client.searchInFolder(folder, {}, 1)).length;
+      if (left > 0) {
+        spinner.warn(chalk.yellow(`  ${folder} — 메일 ${left}개가 남아 폴더를 지우지 않았습니다 (메일은 보존됨)`));
+        logger.warn('CATEGORIZE', `IMAP 폴더 유지: ${folder} (남은 메일 ${left}개)`, true);
+        continue;
       }
       await client.deleteFolder(folder);
       spinner.succeed(
         chalk.green(`  ${folder} 삭제`) +
-        (messages.length ? chalk.gray(`  (메일 ${messages.length}개 받은편지함 복구)`) : '')
+        (moved ? chalk.gray(`  (메일 ${moved}개 받은편지함 복구)`) : '')
       );
-      logger.success('CATEGORIZE', `IMAP 폴더 삭제: ${folder} (복구 ${messages.length}개)`, true);
+      logger.success('CATEGORIZE', `IMAP 폴더 삭제: ${folder} (복구 ${moved}개)`, true);
     } catch (err) {
       spinner.fail(chalk.red(`  ${folder} 실패: ${err.message}`));
       logger.error('CATEGORIZE', `IMAP 폴더 삭제 실패: ${folder} — ${err.message}`, true);
