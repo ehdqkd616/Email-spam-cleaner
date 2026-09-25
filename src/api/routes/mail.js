@@ -429,9 +429,25 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
       await safeReconnect();
     }
 
-    // 이동이 도중에 실패했으면 "복사는 됐는데 원본은 삭제 표시만 된" 메일이 남았을 수 있어 정리한다
-    if (moveFailed) {
-      log('info', '\n🔍 이동 실패로 생겼을 수 있는 중복 메일 확인 중...');
+    // 옮긴 메일의 원본이 받은편지함에서 실제로 사라졌는지 새 연결로 확인한다. Nate는 EXPUNGE에
+    // 항상 "지울 메일 없음"이라고 답하고 실제 삭제는 나중에 반영하므로 응답만으로는 알 수 없다.
+    // 원본이 남아 있으면 중복이 된 것이라 아래 중복 정리로 넘긴다.
+    let leftovers = 0;
+    if (seen.size && !moveFailed) {
+      try {
+        await safeReconnect();
+        leftovers = (await client.findExistingUids('INBOX', [...seen])).length;
+        if (leftovers) log('warn', `  ⚠️ 옮긴 메일 중 ${leftovers}통의 원본이 받은편지함에 남아 있음 — 중복 정리를 진행합니다`);
+        else log('info', '  ✅ 옮긴 메일의 원본이 받은편지함에서 모두 사라진 것 확인');
+      } catch (err) {
+        log('warn', `  ⚠️ 원본 확인 실패: ${err.message} — 중복 정리를 진행합니다`);
+        leftovers = -1;
+      }
+    }
+
+    // 이동이 도중에 실패했거나 원본이 남아 있으면, "복사는 됐는데 원본은 삭제 표시만 된" 메일을 정리한다
+    if (moveFailed || leftovers) {
+      log('info', '\n🔍 중복 메일 확인 중...');
       try {
         await safeReconnect();
         const n = await client.clearDeletedFlags('INBOX');

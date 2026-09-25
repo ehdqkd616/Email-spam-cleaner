@@ -84,15 +84,22 @@ class ImapClient {
   }
 
   _createImap() {
-    // IMAP_DEBUG=1 환경변수로 서버 응답 로깅 활성화 (비밀번호 포함 클라이언트 명령 제외)
+    // IMAP_DEBUG=1 환경변수로 서버 응답 로깅 활성화 (로그인 명령·인증 데이터 줄은 제외)
+    // ImapFlow는 src/msg가 없는 로그(소켓 타임아웃 등)도 보내므로, 어떤 형식이 와도 예외를 내지 않아야 한다
+    // — 예전에는 여기서 난 TypeError가 타이머 안에서 터져 서버 프로세스가 통째로 죽었다(502의 원인).
+    const write = (tag, e) => {
+      try {
+        const entry = e && typeof e === 'object' ? e : { msg: String(e) };
+        const text  = entry.msg ?? entry.err?.message ?? '';
+        if (entry.src === 'c' && (/^[A-Z\d]+ (LOGIN|AUTHENTICATE)/i.test(text) || /^[A-Za-z0-9+/=]{16,}$/.test(text))) return;
+        process.stderr.write(`[IMAP-${tag || (entry.src ? String(entry.src).toUpperCase() : 'LOG')}] ${text}\n`);
+      } catch (_) { /* 디버그 로그 때문에 서버가 죽으면 안 됨 */ }
+    };
     const debugLogger = process.env.IMAP_DEBUG === '1' ? {
-      debug: ({ src, msg }) => {
-        if (src === 'c' && /^[A-Z\d]+ (LOGIN|AUTHENTICATE)/i.test(msg)) return;
-        process.stderr.write(`[IMAP-${src.toUpperCase()}] ${msg}\n`);
-      },
-      info:  ({ src, msg }) => process.stderr.write(`[IMAP-${src.toUpperCase()}] ${msg}\n`),
-      warn:  ({ src, msg }) => process.stderr.write(`[IMAP-WARN] ${msg}\n`),
-      error: ({ src, msg }) => process.stderr.write(`[IMAP-ERR] ${msg}\n`),
+      debug: (e) => write(null, e),
+      info:  (e) => write(null, e),
+      warn:  (e) => write('WARN', e),
+      error: (e) => write('ERR', e),
     } : false;
 
     this.imap = new ImapFlow({ ...this._imapOpts, logger: debugLogger });
@@ -419,6 +426,21 @@ class ImapClient {
     await this.reconnect();
     const left = await this.countDeletedFlagged(folder);
     if (left) throw new Error(`"${folder}"에 삭제 표시된 메일 ${left}통이 해제되지 않아 안전을 위해 중단합니다 (아무 메일도 옮기거나 지우지 않았습니다)`);
+  }
+
+  // uids 중 folder에 아직 남아 있는 것 (50개씩 나눠 조회)
+  async findExistingUids(folder, uids) {
+    const found = [];
+    for (let i = 0; i < uids.length; i += 50) {
+      const chunk = uids.slice(i, i + 50);
+      const hit = await this._withReconnectRetry(async () => {
+        const lock = await this.imap.getMailboxLock(folder);
+        try { return await this.imap.search({ uid: chunk.join(',') }, { uid: true }); }
+        finally { lock.release(); }
+      });
+      found.push(...hit);
+    }
+    return found;
   }
 
   // 폴더의 UID 전체 (폴더가 없으면 빈 배열)
