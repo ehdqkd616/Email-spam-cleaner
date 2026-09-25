@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { api, scanStream, categorizeStream, categorizeAllStream, findDuplicatesStream, dedupeStream, migrateFoldersStream } from '../lib/api';
+import { api, scanStream, categorizeStream, categorizeAllStream } from '../lib/api';
 import { PROVIDERS, cn } from '../lib/utils';
 import Button from '../components/Button';
 import Toast from '../components/Toast';
@@ -53,7 +53,6 @@ export default function Dashboard() {
   const [loading, setLoading]     = useState('');
   const [progress, setProgress]   = useState([]);
   const [logs, setLogs]           = useState([]);
-  const [migrateLogs, setMigrateLogs] = useState([]);
   const [toast, setToast]         = useState(null);
   const [sidebarOpen, setSidebar] = useState(false);
   const [serverLogs, setServerLogs]     = useState([]);
@@ -151,46 +150,6 @@ export default function Dashboard() {
         if (ev === 'error')   { showToast(data.message, 'error'); setLoading(''); stop(); }
       },
       () => { showToast('전체 재분류 오류', 'error'); setLoading(''); }
-    );
-  }
-
-  function handleFindDuplicates() {
-    setLoading('find-duplicates'); setLogs([]);
-    const stop = findDuplicatesStream(selected,
-      (ev, data) => {
-        if (ev === 'log')     setLogs((l) => [...l, data.message]);
-        if (ev === 'complete') {
-          showToast(data.dupGroups > 0 ? `중복 메일 ${data.dupTotal}통 발견 (그룹 ${data.dupGroups}개) — 이동/삭제는 하지 않았습니다` : '중복 메일 없음');
-          setLoading(''); stop();
-        }
-        if (ev === 'error')   { showToast(data.message, 'error'); setLoading(''); stop(); }
-      },
-      () => { showToast('중복 검사 오류', 'error'); setLoading(''); }
-    );
-  }
-
-  function handleDedupe() {
-    if (!window.confirm('중복 메일을 삭제합니다. 그룹당 1통만 남기고 나머지를 영구 삭제합니다. 계속할까요?')) return;
-    setLoading('dedupe'); setLogs([]);
-    const stop = dedupeStream(selected,
-      (ev, data) => {
-        if (ev === 'log')     setLogs((l) => [...l, data.message]);
-        if (ev === 'complete') { showToast(`중복 삭제 완료 — ${data.deleted}통 삭제`); setLoading(''); stop(); }
-        if (ev === 'error')   { showToast(data.message, 'error'); setLoading(''); stop(); }
-      },
-      () => { showToast('중복 삭제 오류', 'error'); setLoading(''); }
-    );
-  }
-
-  function handleMigrateFolders() {
-    setLoading('migrate'); setMigrateLogs([]);
-    const stop = migrateFoldersStream(selected,
-      (ev, data) => {
-        if (ev === 'log')      setMigrateLogs((l) => [...l, data]);
-        if (ev === 'complete') { showToast(`폴더 이름 변경 완료! (${data.total}개 이동)`); setLoading(''); stop(); }
-        if (ev === 'error')    { showToast(data.message, 'error'); setLoading(''); stop(); }
-      },
-      () => { showToast('마이그레이션 오류', 'error'); setLoading(''); }
     );
   }
 
@@ -393,33 +352,12 @@ export default function Dashboard() {
                       <Button variant="outline" size="md" onClick={handleCategorizeAll} loading={loading === 'categorize-all'} disabled={!!loading}>
                         전체 재분류 실행
                       </Button>
-                      {(selected === 'nate' || selected === 'naver') && (
-                        <Button variant="outline" size="md" onClick={handleFindDuplicates} loading={loading === 'find-duplicates'} disabled={!!loading}>
-                          중복 메일 찾기 (읽기전용)
-                        </Button>
-                      )}
-                      {(selected === 'nate' || selected === 'naver') && (
-                        <Button variant="outline" size="md" onClick={handleDedupe} loading={loading === 'dedupe'} disabled={!!loading}>
-                          중복 메일 삭제 실행
-                        </Button>
-                      )}
-                      <Button variant="outline" size="md" onClick={handleMigrateFolders} loading={loading === 'migrate'} disabled={!!loading}>
-                        폴더 이름 정리
-                      </Button>
                     </div>
                     {logs.length > 0 && (
                       <div style={{ marginTop: 16, background: '#f8fafc', borderRadius: 12, padding: 16, maxHeight: 176, overflowY: 'auto', border: '1px solid #e2e8f0' }}>
                         {logs.map((l, i) => (
                           <p key={i} style={{ fontSize: 12, color: '#64748b', fontFamily: 'monospace', lineHeight: 1.6 }}>{l}</p>
                         ))}
-                      </div>
-                    )}
-                    {migrateLogs.length > 0 && (
-                      <div style={{ marginTop: 16, background: '#f8fafc', borderRadius: 12, padding: 16, maxHeight: 176, overflowY: 'auto', border: '1px solid #e2e8f0' }}>
-                        {migrateLogs.map((l, i) => {
-                          const color = l.level === 'error' ? '#dc2626' : l.level === 'success' ? '#16a34a' : '#64748b';
-                          return <p key={i} style={{ fontSize: 12, color, fontFamily: 'monospace', lineHeight: 1.6 }}>{l.message}</p>;
-                        })}
                       </div>
                     )}
                   </div>
