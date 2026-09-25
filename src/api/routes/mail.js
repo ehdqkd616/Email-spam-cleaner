@@ -14,8 +14,17 @@ const DEDUPE_EXCLUDED_FOLDERS = new Set([
   'Sent Messages', 'Drafts', 'Deleted Messages', '내게쓴메일함', '보낸메일함', '임시보관함', '휴지통',
 ]);
 
-async function scanAllFoldersForDuplicates(client, log) {
-  const folders = (await client.listFolders()).filter((f) => !DEDUPE_EXCLUDED_FOLDERS.has(f));
+// 이름이 달라도(예: 네이버) 서버가 보낸편지함·임시보관함·휴지통으로 표시한 폴더는 뺀다
+const DEDUPE_EXCLUDED_SPECIAL_USE = new Set(['\\Sent', '\\Drafts', '\\Trash']);
+
+// onlyFolders를 주면 그 폴더들만 본다 — 분류 작업의 자동 정리는 그 작업이 건드린 폴더(받은편지함·
+// 임시 폴더·카테고리 폴더)로 한정해, 네이버 자체 폴더(SNS·프로모션 등)에 원래 있던 메일은 건드리지 않는다
+async function scanAllFoldersForDuplicates(client, log, onlyFolders = null) {
+  const only = onlyFolders ? new Set(onlyFolders) : null;
+  const folders = (await client.listFoldersDetailed())
+    .filter((f) => !f.noselect && !DEDUPE_EXCLUDED_FOLDERS.has(f.path) && !DEDUPE_EXCLUDED_SPECIAL_USE.has(f.specialUse))
+    .filter((f) => !only || only.has(f.path))
+    .map((f) => f.path);
   log('info', `📋 전체 폴더 ${folders.length}개 읽기전용 스캔 시작 (이동/삭제 없음): ${folders.join(', ')}`);
 
   const all = [];
@@ -88,8 +97,8 @@ async function dedupeGroups(client, dupGroups, log) {
 }
 
 // find-duplicates·dedupe와 동일한 결과를 내도록 스캔→삭제를 한 번에 수행 (자동 안전망용)
-async function scanAndDedupe(client, log) {
-  const { dupGroups } = await scanAllFoldersForDuplicates(client, log);
+async function scanAndDedupe(client, log, onlyFolders = null) {
+  const { dupGroups } = await scanAllFoldersForDuplicates(client, log, onlyFolders);
   if (!dupGroups.length) { log('info', '  중복 없음'); return { deleted: 0, planned: 0 }; }
   return dedupeGroups(client, dupGroups, log);
 }
@@ -453,7 +462,8 @@ router.get('/:provider/categorize', requireAuth, async (req, res) => {
         const n = await client.clearDeletedFlags('INBOX');
         if (n) log('info', `  받은편지함 삭제 표시 ${n}통 해제 (메일은 보존)`);
         await safeReconnect();
-        const { deleted, planned } = await scanAndDedupe(client, (level, msg) => log(level, `  ${msg}`));
+        const touched = ['INBOX', ...CATEGORIES.map((c) => c.name)];
+        const { deleted, planned } = await scanAndDedupe(client, (level, msg) => log(level, `  ${msg}`), touched);
         if (deleted) log('success', `  ✅ 중복 ${deleted.toLocaleString()}통 자동 정리 완료`);
         else if (planned) log('warn', `  ⚠️ 중복 ${planned.toLocaleString()}통 발견했지만 일부만 정리됨 — '중복 메일 찾기'로 다시 확인해주세요`);
       } catch (err) {
@@ -768,7 +778,8 @@ router.get('/:provider/categorize-all', requireAuth, async (req, res) => {
         if (n) log('info', `  "${f}" 이동 중 남은 삭제 표시 ${n}통 해제 (메일은 보존)`);
       }
       await safeReconnect();
-      const { deleted, planned } = await scanAndDedupe(client, (level, msg) => log(level, `  ${msg}`));
+      const touched = ['INBOX', TEMP_FOLDER, ...CATEGORIES.map((c) => c.name)];
+      const { deleted, planned } = await scanAndDedupe(client, (level, msg) => log(level, `  ${msg}`), touched);
       if (deleted) log('success', `  ✅ 중복 ${deleted.toLocaleString()}통 자동 정리 완료`);
       else if (planned) log('warn', `  ⚠️ 중복 ${planned.toLocaleString()}통 발견했지만 일부만 정리됨 — '중복 메일 찾기'로 다시 확인해주세요`);
     } catch (err) {
@@ -794,6 +805,43 @@ router.get('/:provider/categorize-all', requireAuth, async (req, res) => {
   } finally {
     if (client?.disconnect) await client.disconnect().catch(() => {});
     res.end();
+  }
+});
+
+// ── GET /api/mail/:provider/folders  (읽기전용) ──────────────────
+// 폴더 목록·특수 용도·폴더별 메일 수. 큰 작업(전체 재분류 등) 전에 계정 상태를 확인하는 용도로,
+// 메일을 옮기거나 지우지 않는다. 결과는 data/folders-<provider>-<시각>.json에도 저장한다.
+router.get('/:provider/folders', requireAuth, async (req, res) => {
+  const { provider } = req.params;
+  if (!['nate', 'naver'].includes(provider)) {
+    return res.status(400).json({ error: 'IMAP 프로바이더(nate/naver)만 지원합니다' });
+  }
+  let client;
+  try {
+    client = await buildClient(provider, req.session.providers[provider]);
+    const folders = [];
+    for (const f of await client.listFoldersDetailed()) {
+      let messages = null;
+      if (!f.noselect) {
+        try { messages = (await client.imap.status(f.path, { messages: true }))?.messages ?? null; } catch (_) { /* 서버가 STATUS를 거부하면 비워둠 */ }
+      }
+      folders.push({ ...f, messages });
+    }
+    const result = { provider, checkedAt: new Date().toISOString(), totalMessages: folders.reduce((s, f) => s + (f.messages || 0), 0), folders };
+
+    const fs   = require('fs');
+    const path = require('path');
+    const dir  = path.join(__dirname, '..', '..', '..', 'data');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `folders-${provider}-${Date.now()}.json`), JSON.stringify(result, null, 2), 'utf8');
+
+    logger.info('SYSTEM', `[${provider}] 폴더 확인 — ${folders.length}개, 메일 ${result.totalMessages.toLocaleString()}통`);
+    res.json(result);
+  } catch (err) {
+    logger.error('SYSTEM', `[${provider}] 폴더 확인 오류: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (client?.disconnect) await client.disconnect().catch(() => {});
   }
 });
 

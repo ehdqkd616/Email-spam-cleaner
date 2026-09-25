@@ -164,6 +164,16 @@ class ImapClient {
     return list.map((f) => f.path);
   }
 
+  // 폴더 목록 + 특수 용도(\\Sent·\\Trash 등 — 서버가 알려주거나 ImapFlow가 이름으로 추정)
+  async listFoldersDetailed() {
+    const list = await this.imap.list();
+    return list.map((f) => ({
+      path: f.path,
+      specialUse: f.specialUse || null,
+      noselect: !!f.flags?.has('\\Noselect'),
+    }));
+  }
+
   // 폴더 하나를 전부 읽기전용으로 훑는다 (이동/삭제 없음). Nate가 폴더당 1000통만
   // 노출하므로, 1000통 꽉 찬 경우 보이는 최대 UID 뒤쪽을 이어서 읽어 전체를 확보한다.
   async scanFolderAllMessages(folder) {
