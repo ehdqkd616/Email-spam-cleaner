@@ -11,6 +11,8 @@ const logsRouter = require('./src/api/routes/logs');
 
 const app  = express();
 const PORT = process.env.PORT || 3005;
+// 기본은 이 서버 안에서만 접속 (외부는 Caddy 경유). 외부에 직접 열려면 HOST=0.0.0.0
+const HOST = process.env.HOST || '127.0.0.1';
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5174';
 const IS_PROD = process.env.NODE_ENV === 'production';
 
@@ -44,7 +46,7 @@ if (IS_PROD) {
   );
 }
 
-app.listen(PORT, () => {
+app.listen(PORT, HOST, () => {
   console.log(`서버 실행 중 http://localhost:${PORT}`);
   if (!IS_PROD) console.log(`클라이언트: ${CLIENT_URL}`);
 });
