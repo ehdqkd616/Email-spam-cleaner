@@ -1,5 +1,7 @@
 # 메일 스팸 정리기
 
+> 🔗 **배포 주소:** https://mail.hotgarlic.dedyn.io
+
 Gmail, Naver Mail, Nate Mail, 중앙대학교(M365) 이메일의 광고·스팸 메일을 자동으로 분류·정리하는 도구입니다.
 CLI 터미널 모드와 Electron 데스크톱 앱(React 웹 UI 포함) 두 가지 방식으로 사용할 수 있습니다.
 
