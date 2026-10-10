@@ -845,6 +845,41 @@ router.get('/:provider/folders', requireAuth, async (req, res) => {
   }
 });
 
+// ── GET /api/mail/:provider/headers?q=영문검색어  (읽기전용) ──────
+// 제목·발신자에 검색어가 들어간 메일의 폴더·보낸 쪽 날짜(Date 헤더)·서버가 받은 시각·원본 헤더를
+// 보여준다(메일 변경 없음). 결과는 data/headers-<provider>-<시각>.json에도 저장한다.
+// Nate 서버 검색이 한글을 제대로 처리하지 못해 영문 검색어만 받는다.
+router.get('/:provider/headers', requireAuth, async (req, res) => {
+  const { provider } = req.params;
+  const q = String(req.query.q || '').trim();
+  if (!['nate', 'naver'].includes(provider)) {
+    return res.status(400).json({ error: 'IMAP 프로바이더(nate/naver)만 지원합니다' });
+  }
+  if (!q || /[^\x20-\x7E]/.test(q)) {
+    return res.status(400).json({ error: '영문/숫자 검색어를 ?q= 뒤에 넣어주세요 (예: ?q=OpenWeatherMap)' });
+  }
+  let client;
+  try {
+    client = await buildClient(provider, req.session.providers[provider]);
+    const messages = await client.findMessagesWithHeaders(q, 10);
+    const result = { provider, query: q, checkedAt: new Date().toISOString(), count: messages.length, messages };
+
+    const fs   = require('fs');
+    const path = require('path');
+    const dir  = path.join(__dirname, '..', '..', '..', 'data');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `headers-${provider}-${Date.now()}.json`), JSON.stringify(result, null, 2), 'utf8');
+
+    logger.info('SYSTEM', `[${provider}] 헤더 확인 "${q}" — ${messages.length}통`);
+    res.json(result);
+  } catch (err) {
+    logger.error('SYSTEM', `[${provider}] 헤더 확인 오류: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (client?.disconnect) await client.disconnect().catch(() => {});
+  }
+});
+
 // ── GET /api/mail/:provider/find-duplicates  (SSE, 읽기전용) ──────
 // 계정 전체 폴더를 읽기만 하고 Message-ID 기준으로 중복(같은 메일이 여러 폴더/같은 폴더에
 // 두 번 이상 존재)을 찾아 파일로 저장한다. 이동·삭제는 절대 하지 않는다.

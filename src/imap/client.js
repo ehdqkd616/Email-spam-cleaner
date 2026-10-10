@@ -453,6 +453,47 @@ class ImapClient {
     return found;
   }
 
+  // 제목·발신자에 term(영문)이 들어간 메일을 모든 폴더에서 찾아, 보낸 쪽 날짜(Date 헤더)·서버가 받은
+  // 시각(INTERNALDATE)·원본 Date/Received 헤더를 돌려준다. 폴더는 읽기 전용으로만 연다.
+  async findMessagesWithHeaders(term, limit = 10) {
+    const results = [];
+    const folders = (await this.listFoldersDetailed()).filter((f) => !f.noselect).map((f) => f.path);
+    for (const folder of folders) {
+      if (results.length >= limit) break;
+      let uids;
+      try {
+        uids = await this._withReconnectRetry(async () => {
+          const lock = await this.imap.getMailboxLock(folder, { readOnly: true });
+          try { return await this.imap.search({ or: [{ subject: term }, { from: term }] }, { uid: true }); }
+          finally { lock.release(); }
+        });
+      } catch (_) { continue; }
+      if (!uids?.length) continue;
+      const pick = uids.slice(-(limit - results.length));
+      const found = await this._withReconnectRetry(async () => {
+        const out = [];
+        const lock = await this.imap.getMailboxLock(folder, { readOnly: true });
+        try {
+          for await (const msg of this.imap.fetch(pick, { envelope: true, internalDate: true, headers: ['date', 'received'] }, { uid: true })) {
+            const f = msg.envelope?.from?.[0];
+            out.push({
+              folder,
+              uid: msg.uid,
+              subject: msg.envelope?.subject || '',
+              from: f ? (f.name ? `${f.name} <${f.address}>` : f.address) : '',
+              headerDate: safeIso(msg.envelope?.date),
+              internalDate: safeIso(msg.internalDate),
+              rawHeaders: msg.headers ? msg.headers.toString('utf8').trim() : '',
+            });
+          }
+        } finally { lock.release(); }
+        return out;
+      });
+      results.push(...found);
+    }
+    return results;
+  }
+
   // 폴더의 UID 전체 (폴더가 없으면 빈 배열)
   async _searchAllUids(folder) {
     let lock;
