@@ -10,7 +10,8 @@
     "client": "npm run dev --prefix client",
     "dev": "concurrently \"npm run server\" \"npm run client\"",
     "app": "node electron/launch.js",
-    "app:build": "electron-builder --win --x64"
+    "app:build": "electron-builder --win --x64",
+    "test": "node test/client.test.js && node test/routes.test.js && node test/headers.test.js"
   },
   "build": {
     "appId": "com.rudy.mailspamcleaner",
